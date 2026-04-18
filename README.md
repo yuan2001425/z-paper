@@ -1,223 +1,137 @@
 # z-paper
 
-> 本地部署的学术论文管理与翻译工具，专为个人研究者设计。
+> 本地部署的学术论文精准翻译与 AI 知识库对话工具，专为个人研究者设计。
 
-将英文 PDF 论文一键翻译为中英双栏格式，并通过 AI 知识库对话系统与自己的论文库直接交流。所有数据保存在本地，不依赖任何外部数据库或消息队列服务。
+所有数据保存在本地，不依赖任何外部数据库或消息队列服务。
 
 ---
 
-## 核心亮点
+## 下载安装（Windows）
 
-### 📄 智能 PDF 翻译流水线
+无需配置 Python / Node.js 环境，下载后直接安装运行：
 
-- **MinerU 深度解析**：识别多栏布局、数学公式、表格、图注等复杂学术排版，将 PDF 转化为结构化 Markdown
-- **六阶段并行流水线**：解析 → 文本清理（8 并发）→ 术语提取 → 结构分类 → 段落翻译（8 并发）→ 图片翻译（3 并发）
-- **术语审查检查点**：流水线在翻译前自动暂停，提取论文中的领域专有名词请用户确认译法，确认后保存到词库并自动继续
-- **图片文字翻译**：图表、示意图、截图中的文字也可翻译（Qwen-Image-2.0-Pro），支持单张按需翻译
-- **中文论文归档**：中文论文走独立通道，保留结构化索引但跳过翻译
+**百度网盘：** https://pan.baidu.com/s/1ZdRe2TixlulmjIyZI0UEzQ?pwd=6zqp  提取码：6zqp
 
-### 📖 双栏阅读器
+安装完成后桌面出现快捷方式，双击即可启动，浏览器自动打开。
 
-- 英文原文 / 中文译文左右并排，随时切换单栏模式
-- 数学公式用 KaTeX 实时渲染
-- 图片支持放大查看（Lightbox），原图与译图对比
-- 参考文献列表独立展示，文内引用标注可点击跳转
+---
 
-### 🖊 批注系统
+## 一、精准翻译
 
-- **全文批注**：对整篇论文添加总体笔记
-- **划选批注**：精确到具体段落的选中文字批注，保存段落位置（block_id + 文字偏移量）
-- 批注侧边栏与正文同步滚动，点击批注自动定位到对应段落
+学术论文翻译的核心难题不是语言，而是**术语一致性**和**排版还原**。z-paper 通过六阶段并行流水线解决这两个问题。
 
-### 🗂️ 双层词汇系统
+```
+上传 PDF
+  → MinerU 解析（识别多栏/公式/表格/图注）
+  → 并行文本清理（8 并发）：合并 PDF 断行、修正 OCR 错误、规范 LaTeX 格式
+  → 术语提取：自动识别领域专有名词
+  → [暂停] 用户审查新术语，确认每个词的译法（仅翻译 / 保留原文 / 翻译并标注原文）
+  → 带术语表并行翻译段落（8 并发，DeepSeek）+ 图片翻译（3 并发，Qwen）
+  → 生成双栏译文
+```
 
-- **个人词库**：自定义术语，支持三种策略：`正常翻译` / `永不翻译` / `翻译并标注原文`
-- **领域词库**：11 个预设学科领域（计算机科学、数学、物理学、生物学等）的公用参考词表
-- 翻译时自动融合两层词库（个人词库优先覆盖领域词库），每次翻译快照词库状态以保证可复现
+**关键设计：术语审查检查点**
 
-### 🤖 AI 知识库对话
+大多数翻译工具在遇到新术语时会随机翻译，导致同一术语在论文不同位置出现不同译名。z-paper 在翻译前强制暂停，让用户确认每一个新术语的译法，确认后保存到个人词库，后续所有翻译自动复用，保证全文一致。
 
-基于工具调用的 Agent，能够跨论文检索、推理与综合回答。
+**双层词汇系统**
 
-**7 个工具：**
+- **个人词库**：跨论文通用，自定义每个术语的处理策略
+- **领域词库**：11 个预设学科（计算机科学、数学、物理学、生物学等）公用参考词表
+- 每次翻译快照词库状态，译文可复现
 
-| 工具                   | 功能                                                    |
-| ---------------------- | ------------------------------------------------------- |
-| `search_papers`      | 在论文元数据（标题/摘要/关键词）中全文搜索              |
-| `get_paper_outline`  | 获取论文章节大纲                                        |
-| `search_in_paper`    | 在单篇论文全文中关键词检索                              |
-| `get_paper_section`  | 获取指定章节全部段落                                    |
-| `get_references`     | 获取参考文献列表                                        |
-| `get_annotations`    | 获取某篇论文的所有个人批注                              |
-| `search_annotations` | **跨全库**搜索个人批注（支持中文分词 + 子串匹配） |
+**阅读体验**
 
-**三层记忆架构：**
+- 中英双栏并排，支持切换单栏
+- LaTeX 数学公式 KaTeX 实时渲染
+- 图片 Lightbox 放大，原图与译图对比
+- 文内引用 `[1]` 可点击跳转参考文献列表
+- 精确到段落的划选批注系统
 
-- **L1 工作记忆**：当前对话上下文，直接放入 API 请求
-- **L2 压缩记忆**：超过 12 轮后，用 LLM 将旧轮次压缩为摘要，保留最近 3 轮原始内容
+---
+
+## 二、知识库对话
+
+### 设计思想：工具优先，而非塞满 Context
+
+目前大多数"论文问答"产品的做法是 RAG：把检索出的文本块塞进 context，让模型回答。这个方案有明显上限——检索质量决定回答质量，模型没有主动探索的能力。
+
+z-paper 的设计思想借鉴自 **[Claude Code](https://claude.ai/code)**：**不预先决定给模型看什么，而是给 Agent 配备一套工具，让模型自主决定每一步该读哪里、读多少**。就像 Claude Code 不会把整个代码库塞进 context，而是通过工具按需读取文件——context 是稀缺资源，Agent 的价值在于它知道如何高效使用它。
+
+### 7 个工具构成完整的导航能力
+
+| 工具 | 功能 |
+| --- | --- |
+| `search_papers` | 在全库论文元数据（标题/摘要/关键词）中搜索 |
+| `get_paper_outline` | 获取论文章节大纲，决定要不要深入 |
+| `search_in_paper` | 在单篇论文全文中关键词检索 |
+| `get_paper_section` | 获取指定章节全部段落 |
+| `get_references` | 获取参考文献列表 |
+| `get_annotations` | 获取某篇论文的所有个人批注 |
+| `search_annotations` | **跨全库**搜索个人批注（中文分词 + 子串匹配） |
+
+Agent 的典型推理过程：先用 `search_papers` 找到相关论文，再用 `get_paper_outline` 判断哪个章节相关，再用 `get_paper_section` 精确读取，而不是一次性把所有内容放入 context。
+
+### 三层记忆架构，支持长对话
+
+- **L1 工作记忆**：当前对话上下文
+- **L2 压缩记忆**：超过 12 轮后，LLM 自动将旧轮次压缩为摘要，保留最近 3 轮原始内容
 - **L3 持久记忆**：整个论文库 + 词库，通过工具随时可查
 
-**流式输出**：工具调用阶段非流式保证格式准确，最终回答阶段 SSE 流式推送，实时显示打字效果，并实时展示每步工具调用过程。
+### 其他细节
 
-**引用溯源**：每条 AI 回答附带来源引用卡片，按论文分组展示，点击单条引用在新标签页打开原文并**自动滚动定位到对应段落**（精确到 block）。批注类引用同样可以定位到批注所在段落。
-
-**双语搜索策略**：Agent 被指导对中文查询同时搜索中英文关键词，词表之外的术语由模型自行翻译，中文人名还会尝试拼音形式，最大化召回率。
-
-**会话 Minimap**：对话页面右侧有缩略导航栏，显示整段对话的缩略概览，滚动时蓝色视口指示器实时追踪当前位置，点击任意位置可跳转。
-
-### ⚙️ 零配置启动
-
-- 首次启动自动跳转配置页，填写三个 API Key 后即可使用
-- API Key 保存在本地 SQLite 数据库，立即生效无需重启
-- 路由守卫全程拦截：未完成配置时，任何页面都会被重定向到配置页
+- **双语搜索**：中文提问时自动同时搜索中英文关键词，中文人名还会尝试拼音，最大化召回率
+- **流式输出**：工具调用阶段非流式保证 JSON 格式准确，最终回答 SSE 流式推送，实时展示每步工具调用过程
+- **引用溯源**：每条回答附带引用卡片，点击后打开原文并**自动滚动定位到对应段落**（精确到 block 级别）
+- **会话 Minimap**：对话页面右侧缩略导航栏，实时追踪当前位置
 
 ---
 
 ## 技术栈
 
-| 层            | 技术                                   |
-| ------------- | -------------------------------------- |
-| 后端框架      | FastAPI + Uvicorn                      |
-| 数据库        | SQLite（WAL 模式，无需安装数据库服务） |
-| ORM           | SQLAlchemy 2.0                         |
-| 异步          | Python asyncio（无 Celery / Redis）    |
-| HTTP 客户端   | httpx                                  |
-| 前端框架      | Vue 3 (Composition API)                |
-| 构建工具      | Vite 5                                 |
-| UI 组件库     | Element Plus                           |
-| 路由 / 状态   | Vue Router 4 + Pinia                   |
-| Markdown 渲染 | marked                                 |
-| 公式渲染      | KaTeX                                  |
-| 翻译 LLM      | DeepSeek Chat                          |
-| 视觉 LLM      | Qwen-VL-Max / Qwen-Image-2.0-Pro       |
-| PDF 解析      | MinerU API                             |
+| 层 | 技术 | 说明 |
+| --- | --- | --- |
+| 后端框架 | FastAPI + Uvicorn | 异步 HTTP + WebSocket 实时进度推送 |
+| 数据库 | SQLite（WAL 模式） | 零依赖，无需安装任何数据库服务 |
+| ORM | SQLAlchemy 2.0 | |
+| 异步 | Python asyncio | 无 Celery / Redis，纯线程池并发 |
+| 前端框架 | Vue 3 + Vite 5 | |
+| UI 组件库 | Element Plus | |
+| 公式渲染 | KaTeX | |
+| 翻译 LLM | DeepSeek Chat | 段落翻译 + Agent 对话 |
+| 视觉 LLM | Qwen3-VL-Flash / Qwen-Image-2.0-Pro | 文字处理 + 图片翻译 |
+| PDF 解析 | MinerU API | |
 
 ---
 
-## 系统要求
+## 快速启动（源码）
 
-- Python 3.11+
-- Node.js 18+
-- 三个 API Key（首次启动后在界面填写）：
-  - [DeepSeek API Key](https://platform.deepseek.com)（论文翻译 + 知识库对话）
-  - [通义千问 API Key](https://dashscope.console.aliyun.com)（图片识别 + 文本处理）
-  - [MinerU API Key](https://mineru.net)（PDF 解析）
-
----
-
-## 快速启动
+**系统要求：** Python 3.11+、Node.js 18+
 
 ```bash
-# 克隆项目
-git clone <repo-url>
+git clone https://github.com/yuan2001425/z-paper.git
 cd z-paper
 
-# Windows 一键启动
-# 自动创建虚拟环境、安装依赖、初始化数据库、启动前后端
+# Windows
 start.bat
+
+# Linux / macOS
+bash start.sh
 ```
 
-启动后浏览器会自动打开，首次使用跳转配置页填写 API Key 即可。
+首次启动跳转配置页，填写三个 API Key：
 
-| 地址                       | 说明             |
-| -------------------------- | ---------------- |
-| http://localhost:3000      | 前端界面         |
-| http://localhost:8000      | 后端 API         |
-| http://localhost:8000/docs | Swagger API 文档 |
-
----
-
-## 项目结构
-
-```
-z-paper/
-├── start.bat                        # Windows 一键启动
-├── backend/
-│   ├── app/
-│   │   ├── main.py                  # FastAPI 入口，WebSocket 实时进度
-│   │   ├── config.py                # 三层配置（.env → DB → 内存）
-│   │   ├── api/
-│   │   │   ├── papers.py            # 上传、元数据提取、搜索、CRUD
-│   │   │   ├── jobs.py              # 任务管理、术语审查流程
-│   │   │   ├── results.py           # 译文查询、批注 CRUD、按需图片翻译
-│   │   │   ├── chat.py              # 知识库对话（流式 SSE + 普通）
-│   │   │   ├── glossary.py          # 个人词库 CRUD
-│   │   │   ├── domain_glossary.py   # 领域词库 CRUD
-│   │   │   └── settings.py          # API Key 配置读写与状态检查
-│   │   ├── models/                  # 11 个 SQLAlchemy 模型
-│   │   │   ├── paper.py             # 论文元数据
-│   │   │   ├── job.py               # 翻译任务状态机
-│   │   │   ├── result.py            # 译文结构 JSON
-│   │   │   ├── annotation.py        # 全文/划选批注
-│   │   │   ├── user_glossary.py     # 个人词库
-│   │   │   ├── domain_glossary.py   # 领域词库
-│   │   │   ├── chat.py              # 对话会话 + 消息
-│   │   │   ├── app_config.py        # 运行时 Key-Value 配置
-│   │   │   └── ...
-│   │   ├── services/
-│   │   │   ├── pipeline.py          # 翻译六阶段流水线编排
-│   │   │   ├── chat_agent.py        # DeepSeek Agent（工具循环 + 记忆压缩）
-│   │   │   ├── chat_tools.py        # 7 个知识库工具实现
-│   │   │   └── image_translation.py # 图片文字翻译
-│   │   └── translation/
-│   │       ├── pipeline_core.py     # LLM 调用、分块、分类、翻译核心
-│   │       ├── metadata_extractor.py
-│   │       └── title_translator.py
-│   └── data/                        # SQLite 数据库（zpaper.db）
-├── frontend/
-│   └── src/
-│       ├── views/
-│       │   ├── Home.vue             # 论文库主页
-│       │   ├── TranslateUpload.vue  # 上传英文论文
-│       │   ├── ChineseUpload.vue    # 上传中文论文（归档）
-│       │   ├── JobList.vue          # 任务队列 + 术语审查弹窗
-│       │   ├── ResultReader.vue     # 双栏阅读器 + 批注侧边栏
-│       │   ├── UserGlossary.vue     # 个人词库管理
-│       │   ├── ChatView.vue         # 知识库对话（minimap 导航）
-│       │   ├── PaperSearch.vue      # 全文搜索
-│       │   └── SettingsView.vue     # API Key 配置
-│       └── components/
-│           ├── TranslationViewer.vue   # 双栏内容渲染，block 精确定位
-│           ├── AnnotationSidebar.vue   # 批注侧边栏
-│           ├── AppHeader.vue
-│           └── UploadTypeModal.vue
-```
-
----
-
-## 主要工作流
-
-### 翻译一篇英文论文
-
-```
-上传 PDF
-  → MinerU 解析结构
-  → 并行清理文本 & 提取领域术语
-  → [暂停] 用户确认新术语的译法，保存到个人词库
-  → 并行翻译段落（DeepSeek）+ 图片（Qwen）
-  → 生成双栏译文，可立即阅读 & 添加批注
-```
-
-### 与知识库对话
-
-```
-提问（中文或英文均可）
-  → Agent 自动搜索相关论文 & 个人批注（中英双语 + 拼音）
-  → 工具调用过程实时展示（可折叠）
-  → 流式输出回答（Markdown 渲染）
-  → 引用按论文分组，点击可跳转到原文对应段落
-```
+| Key | 用途 | 申请 |
+| --- | --- | --- |
+| DeepSeek API Key | 翻译 + 对话 | https://platform.deepseek.com |
+| 通义千问 API Key | 图片识别 + 文本处理 | https://dashscope.console.aliyun.com |
+| MinerU API Key | PDF 解析 | https://mineru.net |
 
 ---
 
 ## 数据说明
 
-所有数据完全保存在本地：
-
-- 数据库：`backend/data/zpaper.db`（SQLite）
-- 上传文件：`backend/uploads/`
-
-备份这两个目录即可完整迁移数据。
+所有数据完全保存在本地：`backend/data/zpaper.db`（数据库）和 `backend/uploads/`（文件）。备份这两个目录即可完整迁移。
 
 ---
 
