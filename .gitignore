@@ -1,0 +1,26 @@
+# Python
+__pycache__/
+*.py[cod]
+.env
+backend/venv/
+backend/*.db
+backend/uploads/
+backend/results/
+backend/api.log
+
+# Node
+frontend/node_modules/
+frontend/dist/
+
+# Packaging (not needed for source)
+launcher/
+installer/
+dist/
+python-embed/
+icon.svg
+
+# IDE / OS
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
