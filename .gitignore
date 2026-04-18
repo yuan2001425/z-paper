@@ -4,9 +4,10 @@ __pycache__/
 .env
 backend/venv/
 backend/*.db
+backend/data/
+backend/logs/
 backend/uploads/
 backend/results/
-backend/api.log
 
 # Node
 frontend/node_modules/
