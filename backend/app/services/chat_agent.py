@@ -1,10 +1,18 @@
 """
 chat_agent.py — 知识库对话 Agent 主逻辑
 
-三层记忆：
-  L1 工作记忆  — 当前对话 messages（放入 API 请求）
-  L2 压缩记忆  — 超过阈值时 LLM 压缩旧轮次为摘要
-  L3 持久记忆  — DB 会话 + 论文库（通过工具随时可查）
+三层记忆架构（参照 Claude Code）：
+  L1 热数据  — 系统 prompt：静态规则 + 论文目录 + 词表（每轮重建）
+  L2 温数据  — 最近其他会话的 auto_summary，注入系统 prompt
+  L3 冷数据  — 所有历史对话（通过 search_chat_history 工具随时可查）
+
+五级上下文压缩（参照 Claude Code）：
+  L1 剪裁   — 截断旧 tool 消息 content（>4 轮触发，无 LLM）
+  L2 微压缩  — 折叠旧 tool_call+result 对为单行摘要（>8 轮，无 LLM）
+  L3 折叠   — 截短旧 user/assistant 消息（>12 轮，无 LLM）
+  L4 自动压缩 — LLM 全量摘要旧轮（>16 轮，生成 auto_summary）
+  L5 应急压缩 — 强制截断（字符数超限或 413 错误）
+  熔断器    — L4 连续失败 3 次后停止压缩尝试
 """
 
 import json
@@ -21,11 +29,18 @@ from app.services.chat_tools import TOOL_SPECS, execute_tool
 
 logger = logging.getLogger(__name__)
 
-COMPACT_THRESHOLD_TURNS = 12   # 超过此轮数触发压缩
-PRESERVE_RECENT_TURNS   = 3    # 压缩时保留最近 N 轮
-MAX_TOOL_ITERATIONS     = 8    # 单次回答最多工具调用轮数
+# ── 压缩阈值常量 ───────────────────────────────────────────────────────────────
+SNIP_THRESHOLD       = 4      # L1：>N user turns 后截断旧 tool 结果
+MICRO_THRESHOLD      = 8      # L2：>N turns 后折叠旧工具调用对
+FOLD_THRESHOLD       = 12     # L3：>N turns 后截短旧消息
+AUTO_THRESHOLD       = 16     # L4：>N turns 触发 LLM 全量压缩
+PRESERVE_RECENT      = 3      # 所有级别保留最近 N 轮原样
+MAX_COMPACT_FAILURES = 3      # 熔断：L4 连续失败次数上限
+EMERGENCY_CHAR_LIMIT = 80_000 # L5：消息总字符数超限触发应急截断
+MAX_TOOL_ITERATIONS       = 16    # 单次回答最多工具调用轮数
+MAX_QUERY_DB_FAILURES     = 3     # query_database 连续失败次数上限（熔断）
 
-_TIMEOUT_TOOL = httpx.Timeout(connect=15, read=90, write=30, pool=10)
+_TIMEOUT_TOOL   = httpx.Timeout(connect=15, read=90,  write=30, pool=10)
 _TIMEOUT_STREAM = httpx.Timeout(connect=15, read=180, write=30, pool=10)
 
 
@@ -40,6 +55,16 @@ Core rules:
 3. Answer in Chinese unless the user writes in English.
 4. For complex questions, make multiple tool calls to gather comprehensive information.
 
+Tool selection strategy:
+- To find SPECIFIC content (a concept, result, method, claim): use search_in_paper(keyword) — it searches ALL sections including Introduction, which often contains key contributions and definitions. Never skip a section based on its title.
+- To read a COMPLETE section: use get_paper_section — it returns the full concatenated text from that heading to the next same-level heading with no paragraph limit.
+- get_paper_outline is only for understanding overall structure, NOT for deciding which sections to skip.
+- For cross-paper questions ("which papers discuss X"): use search_across_papers instead of calling search_in_paper repeatedly. If the default limit=10 might miss papers, pass a larger limit (e.g., limit=30 or limit=50).
+- When you find a relevant paragraph, use get_paragraph_context to read surrounding context.
+- When you only have a paper_id and need quick metadata: use get_paper_metadata.
+- If the user asks about past conversations: use search_chat_history.
+- query_database is a LAST RESORT tool. Only use it when ALL other tools are insufficient. Prefer the specific tools above for all standard queries.
+
 Critical rule about annotations (批注):
 - Annotations are personal notes written by the USER. They can contain ANYTHING: names, events, relationships, personal reminders — not just academic content.
 - WHENEVER a query mentions a name, a person, or any entity you do not recognise from the paper catalog, you MUST call search_annotations(query) BEFORE concluding it is not found.
@@ -49,14 +74,13 @@ Bilingual search strategy (IMPORTANT):
 - Papers store content in BOTH English (原文) and Chinese (译文).
 - When the user asks in Chinese, you MUST search with BOTH Chinese AND English keywords.
 - For terms IN the Glossary below, use the provided English equivalent.
-- For terms NOT in the Glossary, use your own knowledge to translate them to English before searching. Never skip the English search just because a term is absent from the Glossary.
-- Example: if the user asks about "注意力机制", ALSO search for "attention mechanism".
+- For terms NOT in the Glossary, use your own knowledge to translate them to English before searching.
 - Make separate tool calls for Chinese query AND English query to maximise recall.
 
-Annotation search strategy (IMPORTANT):
-- When calling search_annotations, pass the specific name or keyword as the query — NOT the full question sentence. For example, for "胡熊熊和肖柯羽是什么关系", call search_annotations("胡熊熊") and search_annotations("肖柯羽") separately.
-- Annotations may be written in Chinese, English, OR pinyin romanization. For Chinese names or terms, ALSO try their pinyin romanization as a separate search call. For example, for "胡熊熊" also try search_annotations("huxiongxiong") or search_annotations("hu xiong xiong").
-- Run search_annotations for each important name/entity in the user's question.
+Annotation search strategy:
+- When calling search_annotations, pass specific names/keywords, NOT the full sentence.
+- Annotations may be in Chinese, English, OR pinyin. For Chinese names, also try pinyin.
+- Run search_annotations for each important entity in the user's question.
 """
 
 
@@ -82,7 +106,6 @@ def _build_library_catalog() -> str:
 
 
 def _build_glossary_hint() -> str:
-    """注入用户专有词表，供 agent 发散英文搜索关键词"""
     with SessionLocal() as db:
         terms = (
             db.query(UserGlossary)
@@ -104,13 +127,38 @@ def _build_glossary_hint() -> str:
     return "\n".join(lines)
 
 
-def _system_prompt() -> str:
+def _build_warm_context(session_id: Optional[str] = None) -> str:
+    """L2 温数据：注入最近 3 个其他会话的 auto_summary"""
+    from app.models.chat import ChatSession
+    try:
+        with SessionLocal() as db:
+            q = db.query(ChatSession).filter(
+                ChatSession.auto_summary.isnot(None),
+                ChatSession.auto_summary != "",
+            ).order_by(ChatSession.updated_at.desc())
+            if session_id:
+                q = q.filter(ChatSession.id != session_id)
+            sessions = q.limit(3).all()
+
+        if not sessions:
+            return ""
+
+        lines = ["\n== 往期研究摘要（供参考）=="]
+        for s in sessions:
+            lines.append(f"- 【{s.title[:30]}】{s.auto_summary}")
+        lines.append("")
+        return "\n".join(lines)
+    except Exception:
+        return ""
+
+
+def _system_prompt(session_id: Optional[str] = None) -> str:
     return _STATIC_SYSTEM + _build_library_catalog() + _build_glossary_hint()
 
 
 # ── DeepSeek 调用 ─────────────────────────────────────────────────────────────
 
-def _call_deepseek(messages: list[dict], use_tools: bool = True) -> dict:
+def _call_deepseek(messages: list[dict], use_tools: bool = True, tools: list | None = None) -> dict:
     payload: dict = {
         "model": settings.DEEPSEEK_MODEL,
         "messages": messages,
@@ -118,7 +166,7 @@ def _call_deepseek(messages: list[dict], use_tools: bool = True) -> dict:
         "max_tokens": 4096,
     }
     if use_tools:
-        payload["tools"] = TOOL_SPECS
+        payload["tools"] = tools if tools is not None else TOOL_SPECS
         payload["tool_choice"] = "auto"
 
     with httpx.Client(timeout=_TIMEOUT_TOOL) as client:
@@ -137,8 +185,6 @@ def _call_deepseek(messages: list[dict], use_tools: bool = True) -> dict:
 
 import re as _re
 
-# DeepSeek 有时会在 content 里输出 DSML 格式而非 tool_calls 字段
-# ｜ = U+FF5C FULLWIDTH VERTICAL LINE
 _DSML_BLOCK_RE  = _re.compile(r'<\uFF5CDSML\uFF5Cfunction_calls>.*?</\uFF5CDSML\uFF5Cfunction_calls>', _re.DOTALL)
 _DSML_INVOKE_RE = _re.compile(r'<\uFF5CDSML\uFF5Cinvoke\s+name="([^"]+)">(.*?)</\uFF5CDSML\uFF5Cinvoke>', _re.DOTALL)
 _DSML_PARAM_RE  = _re.compile(r'<\uFF5CDSML\uFF5Cparameter\s+name="([^"]+)"[^>]*>(.*?)</\uFF5CDSML\uFF5Cparameter>', _re.DOTALL)
@@ -146,7 +192,6 @@ _DSML_ANY_RE    = _re.compile(r'<\uFF5CDSML\uFF5C[^>]*>', _re.DOTALL)
 
 
 def _extract_dsml_tool_calls(content: str) -> list[dict]:
-    """从 content 里的 DSML 块中提取工具调用列表"""
     calls = []
     for invoke in _DSML_INVOKE_RE.finditer(content):
         name = invoke.group(1)
@@ -159,7 +204,6 @@ def _extract_dsml_tool_calls(content: str) -> list[dict]:
 
 
 def _iter_raw_chunks(messages: list[dict]) -> Generator[str, None, None]:
-    """底层流式调用，逐 token yield 原始文本（含可能的 DSML）"""
     payload: dict = {
         "model":       settings.DEEPSEEK_MODEL,
         "messages":    messages,
@@ -195,74 +239,214 @@ def _iter_raw_chunks(messages: list[dict]) -> Generator[str, None, None]:
                     pass
 
 
-_DSML_START = "<\uFF5CDSML\uFF5C"                          # <｜DSML｜
-_DSML_FC_CLOSE = "</\uFF5CDSML\uFF5Cfunction_calls>"        # </｜DSML｜function_calls>
+_DSML_START    = "<\uFF5CDSML\uFF5C"
+_DSML_FC_CLOSE = "</\uFF5CDSML\uFF5Cfunction_calls>"
 
 
 def _stream_guarded(messages: list[dict]) -> Generator:
-    """
-    流式答复，遇到 DSML 时自动截断并解析工具调用。
-
-    yield str        → 安全的文本 chunk（直接推前端）
-    yield list[dict] → 解析出的 DSML 工具调用列表（需要执行）
-    """
-    buf     = ""   # 正常文本缓冲（用于跨 chunk 检测 DSML 起始）
-    dsml    = ""   # DSML 累积缓冲
+    buf     = ""
+    dsml    = ""
     in_dsml = False
-    keep    = len(_DSML_START) - 1   # 跨 chunk 边界需要保留的字符数
+    keep    = len(_DSML_START) - 1
 
     for chunk in _iter_raw_chunks(messages):
         if in_dsml:
             dsml += chunk
             if _DSML_FC_CLOSE in dsml:
-                # 完整 DSML 块接收完毕
                 yield _extract_dsml_tool_calls(dsml)
                 return
-            # 继续累积
         else:
             buf += chunk
             idx = buf.find(_DSML_START)
             if idx >= 0:
-                # 先把 DSML 之前的安全文本推出去
                 if idx > 0:
                     yield buf[:idx]
                 dsml    = buf[idx:]
                 buf     = ""
                 in_dsml = True
             else:
-                # 还没遇到 DSML，把安全部分推出去，保留边界
                 if len(buf) > keep:
                     yield buf[:-keep]
                     buf = buf[-keep:]
 
-    # 流结束
     if not in_dsml:
         if buf:
             yield buf
     else:
-        # 流结束时 DSML 不完整，尝试解析已有内容
         calls = _extract_dsml_tool_calls(dsml)
         if calls:
             yield calls
 
 
-# ── 会话压缩 ──────────────────────────────────────────────────────────────────
+# ── 五级压缩系统 ──────────────────────────────────────────────────────────────
 
 def _count_user_turns(messages: list[dict]) -> int:
     return sum(1 for m in messages if m.get("role") == "user")
 
 
-def _compact(messages: list[dict]) -> tuple[list[dict], str]:
-    """压缩旧轮次，保留最近 PRESERVE_RECENT_TURNS 轮"""
+def _estimate_chars(messages: list[dict]) -> int:
+    return sum(len(str(m.get("content") or "")) for m in messages)
+
+
+def _get_cutoff(messages: list[dict]) -> int:
+    """返回"保留最近 PRESERVE_RECENT 轮"的起始索引。"""
     user_count = 0
-    cutoff = 0
     for i in range(len(messages) - 1, -1, -1):
         if messages[i].get("role") == "user":
             user_count += 1
-            if user_count >= PRESERVE_RECENT_TURNS:
-                cutoff = i
-                break
+            if user_count >= PRESERVE_RECENT:
+                return i
+    return 0
 
+
+def _snip_tool_content(content: str) -> str:
+    """将工具结果压缩为结构索引：保留"找到了什么/在哪里"，丢弃具体正文。"""
+    try:
+        data = json.loads(content)
+    except Exception:
+        return content[:150] + "…[已压缩]"
+
+    summary: dict = {"[已压缩]": True}
+
+    # search_in_paper / search_across_papers
+    if "matches" in data:
+        matches = data["matches"]
+        sections = list(dict.fromkeys(
+            m.get("heading_context", "") for m in matches if m.get("heading_context")
+        ))
+        summary["找到"] = f"{len(matches)}处匹配"
+        if sections:
+            summary["章节"] = sections[:4]
+        if matches:
+            summary["最高分block"] = matches[0].get("block_idx")
+        return json.dumps(summary, ensure_ascii=False)
+
+    # search_across_papers results
+    if "results" in data and "keyword" in data:
+        results = data["results"]
+        papers = list(dict.fromkeys(r.get("paper_title", "") for r in results if r.get("paper_title")))
+        summary["找到"] = f"{len(results)}处匹配"
+        summary["涉及论文"] = papers[:4]
+        return json.dumps(summary, ensure_ascii=False)
+
+    # search_papers
+    if "results" in data:
+        results = data["results"]
+        titles = [r.get("title_zh") or r.get("title", "") for r in results]
+        summary["找到"] = f"{len(results)}篇论文"
+        summary["论文列表"] = [{"id": r.get("paper_id"), "title": t} for r, t in zip(results, titles)]
+        return json.dumps(summary, ensure_ascii=False)
+
+    # get_paper_section
+    if "content_zh" in data:
+        summary["章节"] = data.get("section_heading_zh") or data.get("section_heading", "")
+        summary["段落数"] = data.get("paragraph_count", "?")
+        summary["has_more"] = data.get("has_more", False)
+        return json.dumps(summary, ensure_ascii=False)
+
+    # get_paragraph_context
+    if "context" in data:
+        ctx = data["context"]
+        summary["上下文段落数"] = len(ctx)
+        summary["目标block"] = data.get("target_block_idx")
+        return json.dumps(summary, ensure_ascii=False)
+
+    # get_annotations / search_annotations
+    if "annotations" in data:
+        anns = data["annotations"]
+        summary["批注数"] = len(anns)
+        summary["摘要"] = [a.get("content", "")[:40] for a in anns[:3]]
+        return json.dumps(summary, ensure_ascii=False)
+
+    if "results" in data and "count" in data:
+        summary["结果数"] = data.get("count", 0)
+        return json.dumps(summary, ensure_ascii=False)
+
+    # fallback
+    return content[:150] + "…[已压缩]"
+
+
+def _apply_snip(messages: list[dict]) -> list[dict]:
+    """L1：将旧 tool 消息压缩为结构索引（保留找到什么/在哪里，丢弃正文）。"""
+    cutoff = _get_cutoff(messages)
+    result = []
+    for i, m in enumerate(messages):
+        if i < cutoff and m.get("role") == "tool":
+            content = str(m.get("content") or "")
+            if len(content) > 200:
+                m = {**m, "content": _snip_tool_content(content)}
+        result.append(m)
+    return result
+
+
+def _apply_micro_compact(messages: list[dict]) -> list[dict]:
+    """L2：将旧轮中 assistant(tool_calls)+tool(result) 对折叠为单行摘要。"""
+    cutoff = _get_cutoff(messages)
+    result = []
+    skip_ids: set[str] = set()
+
+    i = 0
+    while i < len(messages):
+        m = messages[i]
+        if i >= cutoff:
+            result.append(m)
+            i += 1
+            continue
+
+        if m.get("role") == "assistant" and m.get("tool_calls") and not m.get("content"):
+            tc_list = m["tool_calls"]
+            # 找到这批工具调用对应的所有 tool 结果
+            tool_ids = {tc["id"] for tc in tc_list}
+            summaries = []
+            j = i + 1
+            tool_results: dict[str, str] = {}
+            while j < len(messages) and messages[j].get("role") == "tool":
+                tr = messages[j]
+                if tr.get("tool_call_id") in tool_ids:
+                    tool_results[tr["tool_call_id"]] = str(tr.get("content", ""))[:50]
+                    j += 1
+                else:
+                    break
+
+            for tc in tc_list:
+                name = tc.get("function", {}).get("name", "unknown")
+                try:
+                    args = json.loads(tc.get("function", {}).get("arguments", "{}"))
+                    key_args = ", ".join(f"{k}={repr(v)[:20]}" for k, v in list(args.items())[:2])
+                except Exception:
+                    key_args = ""
+                snippet = tool_results.get(tc["id"], "")[:50]
+                summaries.append(f"[工具调用] {name}({key_args}) → {snippet}")
+
+            result.append({
+                "role":    "assistant",
+                "content": "\n".join(summaries),
+            })
+            i = j  # 跳过已合并的 tool 消息
+            continue
+
+        result.append(m)
+        i += 1
+
+    return result
+
+
+def _apply_fold(messages: list[dict]) -> list[dict]:
+    """L3：截短旧 user/assistant 消息 content 为前 150 字符。"""
+    cutoff = _get_cutoff(messages)
+    result = []
+    for i, m in enumerate(messages):
+        if i < cutoff and m.get("role") in ("user", "assistant") and not m.get("tool_calls"):
+            content = str(m.get("content") or "")
+            if len(content) > 150:
+                m = {**m, "content": content[:150] + "…"}
+        result.append(m)
+    return result
+
+
+def _apply_auto_compact(messages: list[dict]) -> tuple[list[dict], str]:
+    """L4：LLM 全量摘要旧轮次。返回 (压缩后消息, summary文本)。"""
+    cutoff = _get_cutoff(messages)
     old_msgs = messages[:cutoff]
     recent   = messages[cutoff:]
 
@@ -270,23 +454,71 @@ def _compact(messages: list[dict]) -> tuple[list[dict], str]:
         return messages, ""
 
     history_text = "\n".join(
-        f"{m['role'].upper()}: {str(m.get('content',''))[:300]}"
+        f"{m['role'].upper()}: {str(m.get('content',''))[:400]}"
         for m in old_msgs
         if m.get("role") in ("user", "assistant") and m.get("content")
     )
 
-    try:
-        summary_msg = _call_deepseek([
-            {"role": "system", "content": "Summarize the research conversation concisely in Chinese (max 400 chars)."},
-            {"role": "user",   "content": history_text},
-        ], use_tools=False)
-        summary = summary_msg.get("content", "（历史已压缩）")
-    except Exception as e:
-        logger.error(f"[chat_agent] 压缩失败: {e}")
-        summary = "（历史已压缩）"
+    summary_msg = _call_deepseek([
+        {"role": "system", "content": "用3-5句中文概括以下研究对话的核心讨论内容和结论（勿包含工具调用细节）。"},
+        {"role": "user",   "content": history_text},
+    ], use_tools=False)
+    summary = summary_msg.get("content", "（历史已压缩）")
 
     compacted = [{"role": "system", "content": f"[对话历史摘要]\n{summary}"}] + recent
     return compacted, summary
+
+
+def _apply_emergency_compact(messages: list[dict]) -> list[dict]:
+    """L5：强制截断，仅保留最近 PRESERVE_RECENT 轮。"""
+    cutoff = _get_cutoff(messages)
+    recent = messages[cutoff:]
+    return [{"role": "system", "content": "[历史已截断，对话过长]"}] + recent
+
+
+def _compress(
+    messages: list[dict],
+    consecutive_failures: int = 0,
+) -> tuple[list[dict], Optional[str], int]:
+    """
+    五级压缩入口。返回 (压缩后消息, summary|None, 新的连续失败计数)。
+    """
+    # 熔断器
+    if consecutive_failures >= MAX_COMPACT_FAILURES:
+        logger.warning("[chat_agent] 熔断器触发：跳过压缩")
+        return messages, None, consecutive_failures
+
+    turns = _count_user_turns(messages)
+    summary: Optional[str] = None
+
+    # L5 应急（字符数超限）
+    if _estimate_chars(messages) > EMERGENCY_CHAR_LIMIT:
+        logger.warning("[chat_agent] L5 应急压缩：字符数超限")
+        return _apply_emergency_compact(messages), None, consecutive_failures
+
+    # L1 剪裁
+    if turns > SNIP_THRESHOLD:
+        messages = _apply_snip(messages)
+
+    # L2 微压缩
+    if turns > MICRO_THRESHOLD:
+        messages = _apply_micro_compact(messages)
+
+    # L3 折叠
+    if turns > FOLD_THRESHOLD:
+        messages = _apply_fold(messages)
+
+    # L4 自动压缩
+    if turns > AUTO_THRESHOLD:
+        try:
+            messages, summary = _apply_auto_compact(messages)
+            consecutive_failures = 0
+            logger.info("[chat_agent] L4 自动压缩成功")
+        except Exception as e:
+            consecutive_failures += 1
+            logger.error(f"[chat_agent] L4 压缩失败 (连续{consecutive_failures}次): {e}")
+
+    return messages, summary, consecutive_failures
 
 
 # ── 主循环 ────────────────────────────────────────────────────────────────────
@@ -295,19 +527,21 @@ def run_chat_turn(
     user_message: str,
     history: list[dict],
     compaction_summary: Optional[str] = None,
+    session_id: Optional[str] = None,
+    compact_failures: int = 0,
 ) -> dict:
     """
-    执行一轮对话。
+    执行一轮对话（非流式）。
 
     返回：
       answer            — 最终回答文本
       tool_calls        — [{name, args, result_snippet}]
       citations         — [{paper_id, block_idx, text, type, ...}]
       new_history       — 更新后的工作消息列表
-      compaction_summary — 若触发压缩则返回新摘要，否则 None
+      compaction_summary — 若触发 L4 压缩则返回新摘要，否则 None
+      compact_failures  — 更新后的熔断计数
     """
-    # 拼装 API 消息（system + 历史摘要 + 历史 + 当前问题）
-    api_messages: list[dict] = [{"role": "system", "content": _system_prompt()}]
+    api_messages: list[dict] = [{"role": "system", "content": _system_prompt(session_id)}]
     if compaction_summary:
         api_messages.append({"role": "system", "content": f"[对话历史摘要]\n{compaction_summary}"})
     api_messages.extend(history)
@@ -316,9 +550,11 @@ def run_chat_turn(
     tool_call_log: list[dict] = []
     citations: list[dict]     = []
     answer = ""
+    query_db_failures = 0
+    active_tools = TOOL_SPECS
 
     for _iter in range(MAX_TOOL_ITERATIONS):
-        response_msg = _call_deepseek(api_messages)
+        response_msg = _call_deepseek(api_messages, tools=active_tools)
         api_messages.append(response_msg)
 
         tool_calls = response_msg.get("tool_calls")
@@ -326,7 +562,6 @@ def run_chat_turn(
             answer = response_msg.get("content", "")
             break
 
-        # 执行工具
         for tc in tool_calls:
             func   = tc["function"]
             name   = func["name"]
@@ -337,6 +572,24 @@ def run_chat_turn(
 
             logger.info(f"[chat_agent] 工具: {name}({list(args.keys())})")
             result_str = execute_tool(name, args)
+
+            # query_database 熔断：连续失败超限后禁用该工具
+            if name == "query_database":
+                try:
+                    result_data = json.loads(result_str)
+                    if "error" in result_data:
+                        query_db_failures += 1
+                        if query_db_failures >= MAX_QUERY_DB_FAILURES:
+                            result_str = json.dumps({
+                                "error": result_data["error"],
+                                "system": f"query_database 已连续失败 {query_db_failures} 次，已禁用。请停止调用此工具，改用其他工具或直接根据已有信息回答。",
+                            }, ensure_ascii=False)
+                            active_tools = [t for t in TOOL_SPECS if t["function"]["name"] != "query_database"]
+                            logger.warning("[chat_agent] query_database 熔断，已从可用工具中移除")
+                    else:
+                        query_db_failures = 0
+                except Exception:
+                    pass
 
             tool_call_log.append({
                 "name": name,
@@ -351,18 +604,13 @@ def run_chat_turn(
                 "content":      result_str,
             })
     else:
-        # 超出最大迭代
         final = _call_deepseek(api_messages, use_tools=False)
         api_messages.append(final)
         answer = final.get("content", "")
 
-    # 去掉 system 消息，保存工作历史
     new_history = [m for m in api_messages if m.get("role") != "system"]
 
-    # 检查是否需要压缩
-    new_compaction = None
-    if _count_user_turns(new_history) > COMPACT_THRESHOLD_TURNS:
-        new_history, new_compaction = _compact(new_history)
+    new_history, new_compaction, compact_failures = _compress(new_history, compact_failures)
 
     return {
         "answer":             answer,
@@ -370,6 +618,7 @@ def run_chat_turn(
         "citations":          _enrich_citations(citations),
         "new_history":        new_history,
         "compaction_summary": new_compaction,
+        "compact_failures":   compact_failures,
     }
 
 
@@ -377,21 +626,21 @@ def run_chat_turn_stream(
     user_message: str,
     history: list[dict],
     compaction_summary: Optional[str] = None,
+    session_id: Optional[str] = None,
+    compact_failures: int = 0,
 ) -> Generator[dict, None, None]:
     """
-    混合模式：非流式工具循环（可靠） + 流式最终答案（流畅）。
-
-    工具检测阶段使用非流式 API，保证 tool_calls 格式正确、不出 DSML。
-    最终答案阶段使用流式 API（tool_choice="none"），逐 token 推送到前端。
+    混合模式：非流式工具循环 + 流式最终答案。
 
     yield 的 event dict 类型：
       {"type": "tool_start",  "name": str, "args": dict}
       {"type": "tool_done",   "name": str, "snippet": str}
       {"type": "answer_chunk","content": str}
       {"type": "done", "answer": str, "tool_calls": list, "citations": list,
-                        "new_history": list, "compaction_summary": str|None}
+                        "new_history": list, "compaction_summary": str|None,
+                        "compact_failures": int}
     """
-    api_messages: list[dict] = [{"role": "system", "content": _system_prompt()}]
+    api_messages: list[dict] = [{"role": "system", "content": _system_prompt(session_id)}]
     if compaction_summary:
         api_messages.append({"role": "system", "content": f"[对话历史摘要]\n{compaction_summary}"})
     api_messages.extend(history)
@@ -399,24 +648,24 @@ def run_chat_turn_stream(
 
     tool_call_log: list[dict] = []
     citations:     list[dict] = []
+    query_db_failures = 0
+    active_tools = TOOL_SPECS
 
     # ── 阶段一：非流式工具循环 ──────────────────────────────────────────────
     for _iter in range(MAX_TOOL_ITERATIONS):
         try:
-            response_msg = _call_deepseek(api_messages, use_tools=True)
+            response_msg = _call_deepseek(api_messages, use_tools=True, tools=active_tools)
         except Exception as e:
             logger.error(f"[chat_agent] 工具检测调用失败 (iter {_iter}): {e}")
             break
 
         tool_calls = response_msg.get("tool_calls")
 
-        # ── DSML 回退：DeepSeek 有时把工具调用写进 content 而非 tool_calls ──
         if not tool_calls:
             raw_content = response_msg.get("content") or ""
             dsml_calls  = _extract_dsml_tool_calls(raw_content)
             if dsml_calls:
-                logger.info(f"[chat_agent] 检测到 DSML 格式工具调用，转换为标准格式: {[c['name'] for c in dsml_calls]}")
-                # 把 DSML 转成标准 tool_calls 格式，追加到历史
+                logger.info(f"[chat_agent] 检测到 DSML 格式工具调用: {[c['name'] for c in dsml_calls]}")
                 tool_calls = [
                     {
                         "id":       f"dsml_{_iter}_{i}",
@@ -428,13 +677,11 @@ def run_chat_turn_stream(
                     }
                     for i, c in enumerate(dsml_calls)
                 ]
-                # 清理 content 里的 DSML，保留自然语言部分
                 clean_content = _DSML_BLOCK_RE.sub("", raw_content)
                 clean_content = _DSML_ANY_RE.sub("", clean_content).strip() or None
                 response_msg  = {**response_msg, "content": clean_content, "tool_calls": tool_calls}
 
         if not tool_calls:
-            # 确实没有工具调用，进入流式答复阶段
             break
 
         api_messages.append(response_msg)
@@ -451,6 +698,25 @@ def run_chat_turn_stream(
             yield {"type": "tool_start", "name": name, "args": args}
 
             result_str = execute_tool(name, args)
+
+            # query_database 熔断
+            if name == "query_database":
+                try:
+                    result_data = json.loads(result_str)
+                    if "error" in result_data:
+                        query_db_failures += 1
+                        if query_db_failures >= MAX_QUERY_DB_FAILURES:
+                            result_str = json.dumps({
+                                "error": result_data["error"],
+                                "system": f"query_database 已连续失败 {query_db_failures} 次，已禁用。请停止调用此工具，改用其他工具或直接根据已有信息回答。",
+                            }, ensure_ascii=False)
+                            active_tools = [t for t in TOOL_SPECS if t["function"]["name"] != "query_database"]
+                            logger.warning("[chat_agent] query_database 熔断，已从可用工具中移除")
+                    else:
+                        query_db_failures = 0
+                except Exception:
+                    pass
+
             tool_call_log.append({"name": name, "args": args, "result_snippet": result_str[:300]})
             _collect_citations(name, args, result_str, citations)
 
@@ -477,10 +743,14 @@ def run_chat_turn_stream(
                     iter_text.append(item)
                     answer_parts.append(item)
                 elif isinstance(item, list):
-                    dsml_calls = item   # DSML 工具调用
+                    dsml_calls = item
         except Exception as e:
             logger.error(f"[chat_agent] 流式答复失败 (stream_iter {_s}): {e}")
+            # L5 应急检测：413 错误
+            is_413 = "413" in str(e)
             try:
+                if is_413:
+                    api_messages = _apply_emergency_compact(api_messages)
                 fallback = _call_deepseek(api_messages, use_tools=False)
                 text = fallback.get("content", "（生成失败，请重试）")
                 yield {"type": "answer_chunk", "content": text}
@@ -491,7 +761,6 @@ def run_chat_turn_stream(
             break
 
         if dsml_calls:
-            # 把已生成的文本 + DSML 工具调用写入历史
             fake_tcs = [
                 {
                     "id":       f"s{_s}_{i}",
@@ -508,7 +777,6 @@ def run_chat_turn_stream(
                 "content":    "".join(iter_text) or None,
                 "tool_calls": fake_tcs,
             })
-            # 执行这些工具
             for i, c in enumerate(dsml_calls):
                 name = c["name"]
                 args = c["args"]
@@ -523,9 +791,7 @@ def run_chat_turn_stream(
                     "tool_call_id": f"s{_s}_{i}",
                     "content":      result_str,
                 })
-            # 继续下一轮流式
         else:
-            # 正常结束，无 DSML
             if iter_text:
                 api_messages.append({"role": "assistant", "content": "".join(iter_text)})
             break
@@ -533,9 +799,7 @@ def run_chat_turn_stream(
     answer = "".join(answer_parts)
 
     new_history = [m for m in api_messages if m.get("role") != "system"]
-    new_compaction = None
-    if _count_user_turns(new_history) > COMPACT_THRESHOLD_TURNS:
-        new_history, new_compaction = _compact(new_history)
+    new_history, new_compaction, compact_failures = _compress(new_history, compact_failures)
 
     yield {
         "type":               "done",
@@ -544,8 +808,11 @@ def run_chat_turn_stream(
         "citations":          _enrich_citations(citations),
         "new_history":        new_history,
         "compaction_summary": new_compaction,
+        "compact_failures":   compact_failures,
     }
 
+
+# ── 引用收集 ──────────────────────────────────────────────────────────────────
 
 def _collect_citations(tool_name: str, args: dict, result_str: str, citations: list):
     try:
@@ -569,7 +836,7 @@ def _collect_citations(tool_name: str, args: dict, result_str: str, citations: l
             citations.append({
                 "paper_id":      paper_id,
                 "block_idx":     -1,
-                "block_id":      ann.get("block_id", ""),   # "p-N" 格式，供前端精准定位
+                "block_id":      ann.get("block_id", ""),
                 "text":          ann.get("content", ""),
                 "selected_text": ann.get("selected_text", ""),
                 "type":          "annotation",
@@ -601,7 +868,7 @@ def _collect_citations(tool_name: str, args: dict, result_str: str, citations: l
     elif tool_name == "search_papers":
         for item in result.get("results", [])[:3]:
             snippet = item.get("abstract_snippet", "").strip()
-            if not snippet:          # 没有摘要时不产生引用，避免空卡片
+            if not snippet:
                 continue
             citations.append({
                 "paper_id":    item.get("paper_id", ""),
@@ -612,9 +879,33 @@ def _collect_citations(tool_name: str, args: dict, result_str: str, citations: l
                 "type":        "paragraph",
             })
 
+    elif tool_name == "search_across_papers":
+        for item in result.get("results", [])[:3]:
+            text = item.get("text_zh") or item.get("text_en", "")
+            if not text.strip():
+                continue
+            citations.append({
+                "paper_id":    item.get("paper_id", ""),
+                "paper_title": item.get("paper_title", ""),
+                "block_idx":   item.get("block_idx", -1),
+                "heading":     item.get("heading_context", ""),
+                "text":        text,
+                "type":        "paragraph",
+            })
+
+    elif tool_name == "get_paragraph_context":
+        for ctx in result.get("context", [])[:2]:
+            if ctx.get("is_target"):
+                citations.append({
+                    "paper_id":  paper_id,
+                    "block_idx": ctx.get("block_idx", -1),
+                    "heading":   ctx.get("heading_context", ""),
+                    "text":      ctx.get("text_zh") or ctx.get("text_en", ""),
+                    "type":      "paragraph",
+                })
+
 
 def _enrich_citations(citations: list) -> list:
-    """为所有引用补全 paper_title / authors / year（单次 DB 查询）"""
     if not citations:
         return citations
     paper_ids = {c["paper_id"] for c in citations if c.get("paper_id")}
@@ -634,5 +925,4 @@ def _enrich_citations(citations: list) -> list:
         if not c.get("year"):
             c["year"] = p.year
 
-    # 过滤掉 text 为空的引用（避免前端出现无内容的空卡片）
     return [c for c in citations if (c.get("text") or "").strip()]

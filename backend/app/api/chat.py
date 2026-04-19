@@ -70,6 +70,8 @@ def send_message(req: ChatRequest, db: Session = Depends(get_db)):
         user_message=req.message,
         history=session.history_json or [],
         compaction_summary=session.compaction_summary,
+        session_id=session.id,
+        compact_failures=session.compact_failures or 0,
     )
 
     # 保存 AI 回复
@@ -85,10 +87,12 @@ def send_message(req: ChatRequest, db: Session = Depends(get_db)):
     ))
 
     # 更新会话历史
-    session.history_json = result["new_history"]
-    session.updated_at = datetime.utcnow()
+    session.history_json    = result["new_history"]
+    session.updated_at      = datetime.utcnow()
+    session.compact_failures = result.get("compact_failures", 0)
     if result["compaction_summary"]:
         session.compaction_summary = result["compaction_summary"]
+        session.auto_summary       = result["compaction_summary"]
 
     db.commit()
 
@@ -139,14 +143,15 @@ def send_message_stream(req: ChatRequest):
         ))
         db.commit()
 
-        session_id       = session.id
-        history          = list(session.history_json or [])
+        session_id         = session.id
+        history            = list(session.history_json or [])
         compaction_summary = session.compaction_summary
+        compact_failures   = session.compact_failures or 0
 
     def sse_gen():
         final: dict = {}
         try:
-            for event in run_chat_turn_stream(req.message, history, compaction_summary):
+            for event in run_chat_turn_stream(req.message, history, compaction_summary, session_id, compact_failures):
                 if event["type"] == "done":
                     final = event
                 else:
@@ -170,10 +175,12 @@ def send_message_stream(req: ChatRequest):
                         citations_json=final.get("citations", []),
                         created_at=datetime.utcnow(),
                     ))
-                    s.history_json  = final.get("new_history", history)
-                    s.updated_at    = datetime.utcnow()
+                    s.history_json       = final.get("new_history", history)
+                    s.updated_at         = datetime.utcnow()
+                    s.compact_failures   = final.get("compact_failures", 0)
                     if final.get("compaction_summary"):
                         s.compaction_summary = final["compaction_summary"]
+                        s.auto_summary       = final["compaction_summary"]
                     db.commit()
         except Exception as e:
             pass  # DB 保存失败不影响客户端已收到的内容

@@ -339,6 +339,8 @@ async function sendMessage() {
   } finally {
     aiMsg.isStreaming = false
     streaming.value  = false
+    // 流结束后自动折叠工具调用面板
+    expandedSteps[aiMsg.id] = false
     await nextTick()
     scrollToBottom()
   }
@@ -401,19 +403,26 @@ function toggleCitations(id) {
 }
 
 function toolSummary(toolCalls) {
+  const total = toolCalls.length
   const names = [...new Set(toolCalls.map(t => toolLabel(t.name)))]
-  return names.slice(0, 3).join('、') + (names.length > 3 ? '等' : '')
+  const label = names.slice(0, 2).join('、') + (names.length > 2 ? ' 等' : '')
+  return total > 1 ? `${label}（共 ${total} 次）` : label
 }
 
 function toolLabel(name) {
   const map = {
-    search_papers:      '搜索论文',
-    get_paper_outline:  '查看大纲',
-    search_in_paper:    '搜索全文',
-    get_paper_section:  '读取章节',
-    get_references:     '查看参考文献',
-    get_annotations:    '读取批注',
-    search_annotations: '搜索批注',
+    search_papers:         '搜索论文',
+    get_paper_outline:     '查看大纲',
+    search_in_paper:       '搜索全文',
+    get_paper_section:     '读取章节',
+    get_references:        '查看参考文献',
+    get_annotations:       '读取批注',
+    search_annotations:    '搜索批注',
+    search_across_papers:  '跨库搜索',
+    get_paragraph_context: '读取上下文',
+    get_paper_metadata:    '获取论文信息',
+    search_chat_history:   '搜索历史对话',
+    query_database:        '数据库查询',
   }
   return map[name] || name
 }
@@ -421,9 +430,13 @@ function toolLabel(name) {
 function formatArgs(args) {
   if (!args) return ''
   const parts = []
-  if (args.query)   parts.push(`"${args.query}"`)
-  if (args.heading) parts.push(`§ ${args.heading}`)
-  if (args.section) parts.push(`节: ${args.section}`)
+  if (args.query)                    parts.push(`"${args.query}"`)
+  if (args.keyword)                  parts.push(`"${args.keyword}"`)
+  if (args.heading)                  parts.push(`§ ${args.heading}`)
+  if (args.section)                  parts.push(`节: ${args.section}`)
+  if (args.block_idx !== undefined)  parts.push(`段落 #${args.block_idx}`)
+  if (args.paper_id && !args.query && !args.keyword && !args.heading)
+    parts.push(`论文 ${String(args.paper_id).slice(0, 8)}…`)
   return parts.join(' · ')
 }
 

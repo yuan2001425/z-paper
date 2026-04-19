@@ -32,6 +32,22 @@ os.makedirs(settings.LOCAL_UPLOAD_PATH, exist_ok=True)
 from app.database import Base, engine
 from app import models as _models  # noqa: F401 — 触发所有模型注册
 Base.metadata.create_all(bind=engine)
+
+# 为已存在的旧表补充新增列（SQLite 不支持 create_all 自动加列）
+from sqlalchemy import text as _sql_text
+with engine.connect() as _conn:
+    for _col, _def in [
+        ("auto_summary",     "TEXT"),
+        ("compact_failures", "INTEGER DEFAULT 0"),
+    ]:
+        try:
+            _conn.execute(_sql_text(
+                f"ALTER TABLE chat_sessions ADD COLUMN {_col} {_def}"
+            ))
+        except Exception:
+            pass  # 列已存在时 SQLite 会报错，直接忽略
+    _conn.commit()
+
 load_db_config()   # 用 DB 里保存的 key 覆盖内存配置（.env 缺失时依然生效）
 app.mount("/uploads", StaticFiles(directory=settings.LOCAL_UPLOAD_PATH), name="uploads")
 
