@@ -1,7 +1,11 @@
 import asyncio
+import difflib
+import logging
+import time
 import uuid
 from typing import Optional
 from fastapi import APIRouter, Depends, UploadFile, File, Form, HTTPException, Query
+from pydantic import BaseModel
 from sqlalchemy.orm import Session
 
 from app.database import get_db
@@ -10,7 +14,48 @@ from app.models.job import TranslationJob, JobStatus, JobType
 from app.schemas.paper import PaperResponse, PaperSearchResponse
 from app.storage.local_storage import local_storage
 
+logger = logging.getLogger(__name__)
 router = APIRouter()
+
+
+class DuplicateCheckRequest(BaseModel):
+    title: str = ""
+    title_zh: str = ""
+
+
+def _title_similarity(a: str, b: str) -> float:
+    """大小写不敏感的标题相似度，0~1。"""
+    a, b = a.lower().strip(), b.lower().strip()
+    if not a or not b:
+        return 0.0
+    return difflib.SequenceMatcher(None, a, b).ratio()
+
+
+@router.post("/check-duplicate")
+def check_duplicate(body: DuplicateCheckRequest, db: Session = Depends(get_db)):
+    """检测库中是否存在相似标题的论文，返回相似度 ≥ 0.6 的结果（最多5条）。"""
+    papers = db.query(Paper).all()
+    results = []
+    for p in papers:
+        # 分别与外文标题和中文标题比较，取最高分
+        sim = max(
+            _title_similarity(body.title, p.title or ""),
+            _title_similarity(body.title, p.title_zh or ""),
+            _title_similarity(body.title_zh, p.title or ""),
+            _title_similarity(body.title_zh, p.title_zh or ""),
+        )
+        if sim >= 0.6:
+            results.append({
+                "paper_id": p.id,
+                "title": p.title or "",
+                "title_zh": p.title_zh or "",
+                "journal": p.journal or "",
+                "year": p.year,
+                "similarity": round(sim, 2),
+                "pdf_url": local_storage.get_url(p.storage_key) if p.storage_key else None,
+            })
+    results.sort(key=lambda x: x["similarity"], reverse=True)
+    return {"duplicates": results[:5]}
 
 
 @router.post("/extract-metadata")
@@ -21,18 +66,28 @@ async def extract_metadata(
     db: Session = Depends(get_db),
 ):
     """上传 PDF，用 Qwen-VL 从第一页提取论文元数据。"""
+    t_req = time.time()
+    logger.info("[/extract-metadata] 收到请求 filename=%s size=%.1fKB",
+                file.filename, (file.size or 0) / 1024)
+
     if not file.filename.lower().endswith(".pdf"):
         raise HTTPException(status_code=400, detail="只支持 PDF 文件")
 
     content = await file.read()
+    logger.info("[/extract-metadata] 文件读取完成 actual_size=%.1fKB 耗时=%.2fs",
+                len(content) / 1024, time.time() - t_req)
 
     from app.services.metadata_extractor import metadata_extractor
     from app.services.title_translator import translate_title
     from app.models.user_glossary import UserGlossary
 
+    t0 = time.time()
     result = metadata_extractor.extract(content, user_domain=domain, paper_type=paper_type)
+    logger.info("[/extract-metadata] metadata_extractor 返回 耗时=%.2fs title=%r",
+                time.time() - t0, result.get("title", "")[:60])
 
     if result.get("title") and not result.get("title_zh"):
+        t0 = time.time()
         glossary_terms = db.query(UserGlossary).all()
         result["title_zh"] = translate_title(
             title=result["title"],
@@ -40,7 +95,10 @@ async def extract_metadata(
             glossary_terms=glossary_terms,
             domain=domain,
         )
+        logger.info("[/extract-metadata] title_translator 返回 耗时=%.2fs title_zh=%r",
+                    time.time() - t0, result.get("title_zh", "")[:60])
 
+    logger.info("[/extract-metadata] 请求完成 总耗时=%.2fs", time.time() - t_req)
     return result
 
 

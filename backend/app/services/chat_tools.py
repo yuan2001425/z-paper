@@ -13,10 +13,14 @@ chat_tools.py — 知识库对话 Agent 的工具集
  9. get_paragraph_context  — 获取某段落的前后文
 10. get_paper_metadata     — 快速获取论文元数据（标题/摘要/作者/关键词）
 11. search_chat_history    — 搜索历史对话记录（L3 冷数据）
+12. generate_image         — 文生图（qwen-image-2.0）
+13. edit_image             — 图片编辑（qwen-image-2.0-pro）
 """
 
+import base64
 import json
 import logging
+import uuid
 from typing import Optional
 
 from app.database import SessionLocal, engine
@@ -86,7 +90,7 @@ def _cutoff_index(blocks: list[dict], preserve_recent_turns: int = 3) -> int:
 
 # ── 工具 1-7（原有） ────────────────────────────────────────────────────────────
 
-def search_papers(query: str, domain: Optional[str] = None, limit: int = 10) -> str:
+def search_papers(query: str, domain: Optional[str] = None, limit=10) -> str:
     query_lower = query.lower()
     with SessionLocal() as db:
         papers = db.query(Paper).all()
@@ -107,7 +111,7 @@ def search_papers(query: str, domain: Optional[str] = None, limit: int = 10) -> 
 
     results.sort(key=lambda x: x[0], reverse=True)
     output = []
-    for _, p in results[:limit]:
+    for _, p in results[:int(limit)]:
         output.append({
             "paper_id": p.id,
             "title": p.title or "",
@@ -148,7 +152,7 @@ def get_paper_outline(paper_id: str) -> str:
     }, ensure_ascii=False)
 
 
-def search_in_paper(paper_id: str, query: str, section: Optional[str] = None, limit: int = 8) -> str:
+def search_in_paper(paper_id: str, query: str, section: Optional[str] = None, limit=8) -> str:
     result = _get_result(paper_id)
     if not result:
         return json.dumps({"error": "未找到该论文的处理结果"}, ensure_ascii=False)
@@ -193,7 +197,7 @@ def search_in_paper(paper_id: str, query: str, section: Optional[str] = None, li
     keywords = query_lower.split() + (section.lower().split() if section else [])
     relevant_annotations = _filter_relevant_annotations(all_annotations, keywords)
 
-    out: dict = {"paper_id": paper_id, "matches": matches[:limit]}
+    out: dict = {"paper_id": paper_id, "matches": matches[:int(limit)]}
     if relevant_annotations:
         out["annotations"] = relevant_annotations
         out["annotation_note"] = _annotations_note(relevant_annotations)
@@ -333,7 +337,7 @@ def search_annotations(query: str) -> str:
 
 # ── 工具 8-11（新增） ──────────────────────────────────────────────────────────
 
-def search_across_papers(keyword: str, limit: int = 10) -> str:
+def search_across_papers(keyword: str, limit=10) -> str:
     """在全库所有论文全文中搜索关键词，返回最相关的段落片段。"""
     keyword_lower = keyword.lower()
     all_matches = []
@@ -368,7 +372,7 @@ def search_across_papers(keyword: str, limit: int = 10) -> str:
     all_matches.sort(key=lambda x: x["score"], reverse=True)
     return json.dumps({
         "keyword": keyword,
-        "results": all_matches[:limit],
+        "results": all_matches[:int(limit)],
         "total_found": len(all_matches),
     }, ensure_ascii=False)
 
@@ -446,7 +450,7 @@ def query_database(sql: str) -> str:
         return json.dumps({"error": str(e)}, ensure_ascii=False)
 
 
-def search_chat_history(query: str, limit: int = 5) -> str:
+def search_chat_history(query: str, limit=5) -> str:
     """在所有历史对话的 AI 回复中搜索关键词（L3 冷数据）。"""
     from app.models.chat import ChatMessage, ChatSession
     query_lower = f"%{query.lower()}%"
@@ -461,7 +465,7 @@ def search_chat_history(query: str, limit: int = 5) -> str:
                 ChatMessage.content.ilike(query_lower),
             )
             .order_by(ChatMessage.created_at.desc())
-            .limit(limit)
+            .limit(int(limit))
             .all()
         )
         for msg, sess in matches:
@@ -485,6 +489,92 @@ def search_chat_history(query: str, limit: int = 5) -> str:
     }, ensure_ascii=False)
 
 
+# ── 图片生成 / 编辑 ────────────────────────────────────────────────────────────
+
+def _call_image_api(payload: dict) -> str:
+    """调用 DashScope 图片生成接口，返回生成图片的外部 URL。"""
+    import httpx
+    from app.config import settings
+    from app.services.image_translation import _http_post_with_retry
+    resp = _http_post_with_retry(
+        url=f"{settings.QWEN_DASHSCOPE_BASE_URL}/services/aigc/multimodal-generation/generation",
+        headers={"Authorization": f"Bearer {settings.QWEN_API_KEY}", "Content-Type": "application/json"},
+        body=payload,
+        timeout=120,
+    )
+    data = resp.json()
+    choices = data.get("output", {}).get("choices", [])
+    if not choices:
+        raise ValueError(f"API 无输出: {str(data)[:200]}")
+    content = choices[0].get("message", {}).get("content", [])
+    img_url = next((c["image"] for c in content if "image" in c), None)
+    if not img_url:
+        raise ValueError(f"响应中无图片: {str(content)[:200]}")
+    return img_url
+
+
+def _save_remote_image(remote_url: str, filename: str) -> str:
+    """下载远程图片，保存到 chat_generated/，返回本地 /uploads/... URL。"""
+    import httpx
+    from app.storage.local_storage import local_storage
+    with httpx.Client(timeout=60) as client:
+        r = client.get(remote_url)
+        r.raise_for_status()
+    key = f"chat_generated/{filename}"
+    local_storage.put_object(key, r.content, content_type="image/jpeg")
+    return local_storage.get_url(key)
+
+
+def generate_image(prompt: str) -> str:
+    """根据提示词生成图片，返回图片 URL。"""
+    from app.config import settings
+    if not settings.QWEN_API_KEY:
+        return json.dumps({"error": "QWEN_API_KEY 未配置"}, ensure_ascii=False)
+    logger.info("[chat_tools] generate_image prompt=%r", prompt[:80])
+    try:
+        payload = {
+            "model": settings.QWEN_IMAGE_GEN_MODEL,
+            "input": {"messages": [{"role": "user", "content": [{"text": prompt}]}]},
+            "parameters": {"n": 1, "watermark": False},
+        }
+        remote_url = _call_image_api(payload)
+        local_url = _save_remote_image(remote_url, f"{uuid.uuid4().hex}.jpg")
+        return json.dumps({"image_url": local_url, "prompt_used": prompt}, ensure_ascii=False)
+    except Exception as e:
+        logger.error("[chat_tools] generate_image 失败: %s", e)
+        return json.dumps({"error": str(e)}, ensure_ascii=False)
+
+
+def edit_image(image_url: str, instruction: str) -> str:
+    """对已有图片按指令编辑，返回新图片 URL。"""
+    from app.config import settings
+    from app.storage.local_storage import local_storage
+    if not settings.QWEN_API_KEY:
+        return json.dumps({"error": "QWEN_API_KEY 未配置"}, ensure_ascii=False)
+    logger.info("[chat_tools] edit_image url=%r instruction=%r", image_url, instruction[:80])
+    try:
+        # 读取本地图片
+        key = image_url.lstrip("/")
+        if key.startswith("uploads/"):
+            key = key[len("uploads/"):]
+        img_bytes = local_storage.get_object(key)
+        b64 = base64.b64encode(img_bytes).decode()
+        payload = {
+            "model": settings.QWEN_IMAGE_MODEL,
+            "input": {"messages": [{"role": "user", "content": [
+                {"image": f"data:image/jpeg;base64,{b64}"},
+                {"text": instruction},
+            ]}]},
+            "parameters": {"n": 1, "watermark": False, "prompt_extend": False},
+        }
+        remote_url = _call_image_api(payload)
+        local_url = _save_remote_image(remote_url, f"{uuid.uuid4().hex}_edited.jpg")
+        return json.dumps({"image_url": local_url}, ensure_ascii=False)
+    except Exception as e:
+        logger.error("[chat_tools] edit_image 失败: %s", e)
+        return json.dumps({"error": str(e)}, ensure_ascii=False)
+
+
 # ── 工具注册表 + OpenAI-compatible specs ──────────────────────────────────────
 
 TOOL_REGISTRY = {
@@ -500,6 +590,8 @@ TOOL_REGISTRY = {
     "get_paper_metadata":    get_paper_metadata,
     "search_chat_history":   search_chat_history,
     "query_database":        query_database,
+    "generate_image":        generate_image,
+    "edit_image":            edit_image,
 }
 
 TOOL_SPECS = [
@@ -711,6 +803,35 @@ RULES:
                     "sql": {"type": "string", "description": "A valid SQL SELECT statement"},
                 },
                 "required": ["sql"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "generate_image",
+            "description": "根据提示词生成一张图片。当需要用图片可视化论文核心概念、流程、对比关系时使用。生成后将返回的 image_url 以 Markdown ![说明](url) 格式嵌入回答，提示词应尽量丰富具体。",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "prompt": {"type": "string", "description": "详细的图片生成提示词，描述内容、布局、风格、颜色、标注等"},
+                },
+                "required": ["prompt"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "edit_image",
+            "description": "对已有图片按指令进行修改。仅在用户明确要求编辑某张图片时调用，需提供图片 URL 和修改说明。",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "image_url": {"type": "string", "description": "要编辑的图片 URL（/uploads/chat_generated/... 格式）"},
+                    "instruction": {"type": "string", "description": "编辑指令，描述要做什么修改"},
+                },
+                "required": ["image_url", "instruction"],
             },
         },
     },

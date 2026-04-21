@@ -34,12 +34,13 @@
       </el-dialog>
 
       <section class="paper-list">
-        <h2>最近收录</h2>
-        <el-row :gutter="16">
-          <el-col v-for="paper in papers" :key="paper.id" :span="8">
-            <PaperCard :paper="paper" />
-          </el-col>
-        </el-row>
+        <div class="section-header">
+          <h2>最近收录</h2>
+          <el-link @click="$router.push('/search')" type="primary" style="font-size:0.9rem">查看全部</el-link>
+        </div>
+        <div class="masonry">
+          <PaperCard v-for="paper in papers" :key="paper.id" :paper="paper" />
+        </div>
         <el-empty v-if="papers.length === 0" description="还没有论文，上传第一篇开始吧" />
       </section>
     </main>
@@ -66,7 +67,7 @@ const readmeHtml = computed(() => marked.parse(readmeMd))
 
 onMounted(async () => {
   try {
-    const res = await api.get('/papers/search', { params: { page_size: 9 } })
+    const res = await api.get('/papers/search', { params: { page_size: 3 } })
     papers.value = res.data.items
   } catch {}
 })
@@ -81,7 +82,10 @@ onMounted(async () => {
 .hero p { font-size: 1.2rem; color: #606266; margin-bottom: 32px; }
 .hero-actions { display: flex; justify-content: center; gap: 16px; }
 .paper-list { margin-top: 40px; }
-.paper-list h2 { font-size: 1.4rem; color: #303133; margin-bottom: 20px; }
+.section-header { display: flex; align-items: baseline; justify-content: space-between; margin-bottom: 20px; }
+.section-header h2 { font-size: 1.4rem; color: #303133; margin: 0; }
+.masonry { columns: 3; column-gap: 16px; }
+.masonry > * { break-inside: avoid; margin-bottom: 16px; }
 </style>
 
 <style>

@@ -194,15 +194,9 @@ function openPdf() {
 .content-area { padding-right: 32px; min-width: 0; overflow-x: hidden; }
 
 .paper-header {
-  position: sticky;
-  top: 57px;
-  z-index: 90;
-  background: #fff;
-  padding: 12px 32px 12px 0;
-  margin-right: -32px;
   margin-bottom: 20px;
+  padding-bottom: 12px;
   border-bottom: 2px solid #e4e7ed;
-  box-shadow: 0 2px 6px rgba(0,0,0,0.04);
 }
 .paper-title-en { font-size: 1.15rem; font-weight: 700; color: #303133; margin: 0 0 4px; line-height: 1.4; font-family: 'Times New Roman', serif; }
 .paper-title-zh { font-size: 1rem; font-weight: 600; color: #409eff; margin: 0 0 6px; line-height: 1.4; }
@@ -213,8 +207,8 @@ function openPdf() {
 /* 右侧固定列 */
 .right-panel {
   position: sticky;
-  top: 57px;
-  height: calc(100vh - 73px);
+  top: 108px;
+  height: calc(100vh - 124px);
   display: flex;
   flex-direction: column;
   border-left: 1px solid #e4e7ed;

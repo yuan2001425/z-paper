@@ -85,6 +85,11 @@ class MetadataExtractor:
         失败时静默返回空结构，不抛出异常（表单允许用户手动填写）。
         返回字段中 division_tags 为 list[str]，供前端直接赋值给 el-select multiple。
         """
+        import time
+        t_total = time.time()
+        logger.info("[extract-metadata] 开始 pdf_size=%.1fKB domain=%s type=%s",
+                    len(pdf_bytes) / 1024, user_domain, paper_type)
+
         empty = {
             "title": "", "title_zh": "", "journal": "",
             "year": "", "source_language": "en",
@@ -94,33 +99,48 @@ class MetadataExtractor:
         }
 
         if not settings.QWEN_API_KEY:
-            logger.warning("QWEN_API_KEY 未配置，跳过元数据提取")
+            logger.warning("[extract-metadata] QWEN_API_KEY 未配置，跳过元数据提取")
             return empty
 
         try:
+            t0 = time.time()
             image_b64 = self._render_first_page(pdf_bytes)
-            return self._call_qwen_vl(image_b64, user_domain, paper_type)
+            logger.info("[extract-metadata] PDF渲染完成 img_size=%.1fKB 耗时=%.2fs",
+                        len(image_b64) * 3 / 4 / 1024, time.time() - t0)
+
+            result = self._call_qwen_vl(image_b64, user_domain, paper_type)
+            logger.info("[extract-metadata] 全流程完成 总耗时=%.2fs", time.time() - t_total)
+            return result
         except Exception as e:
-            logger.warning(f"MetadataExtractor 失败，将由用户手动填写: {e}")
+            logger.warning("[extract-metadata] 失败 耗时=%.2fs 原因=%s",
+                           time.time() - t_total, e)
             return empty
 
     def _render_first_page(self, pdf_bytes: bytes) -> str:
+        import time
+        t0 = time.time()
+        logger.info("[extract-metadata] fitz.open 开始")
         doc = fitz.open(stream=pdf_bytes, filetype="pdf")
         page = doc[0]
-        mat = fitz.Matrix(2.0, 2.0)
+        # 获取页面原始尺寸，限制渲染目标宽度最大 1200px，避免大 PDF 渲染超时
+        rect = page.rect
+        target_w = 1200
+        scale = min(2.0, target_w / rect.width) if rect.width > 0 else 1.5
+        logger.info("[extract-metadata] 页面尺寸=%.0fx%.0f scale=%.2f", rect.width, rect.height, scale)
+        mat = fitz.Matrix(scale, scale)
         pix = page.get_pixmap(matrix=mat)
+        logger.info("[extract-metadata] get_pixmap 完成 耗时=%.2fs size=%dx%d", time.time() - t0, pix.width, pix.height)
         img_bytes = pix.tobytes("png")
         doc.close()
         return base64.b64encode(img_bytes).decode()
 
     def _call_qwen_vl(self, image_b64: str, user_domain: str | None, paper_type: str = "journal") -> dict:
+        import time
         prompt = _build_prompt(user_domain, paper_type)
-        logger.warning(
-            "[MetadataExtractor] → %s\n%s\n%s",
-            settings.QWEN_VL_MODEL,
-            "-" * 60,
-            prompt,
-        )
+        img_kb = len(image_b64) * 3 / 4 / 1024
+        logger.info("[extract-metadata] → Qwen-VL model=%s img=%.1fKB url=%s",
+                    settings.QWEN_VL_MODEL, img_kb, settings.QWEN_BASE_URL)
+
         payload = {
             "model": settings.QWEN_VL_MODEL,
             "messages": [
@@ -137,18 +157,30 @@ class MetadataExtractor:
             ],
         }
 
-        with httpx.Client(timeout=30) as client:
-            resp = client.post(
-                f"{settings.QWEN_BASE_URL}/chat/completions",
-                headers={
-                    "Authorization": f"Bearer {settings.QWEN_API_KEY}",
-                    "Content-Type": "application/json",
-                },
-                json=payload,
-            )
+        t0 = time.time()
+        try:
+            with httpx.Client(timeout=90) as client:
+                resp = client.post(
+                    f"{settings.QWEN_BASE_URL}/chat/completions",
+                    headers={
+                        "Authorization": f"Bearer {settings.QWEN_API_KEY}",
+                        "Content-Type": "application/json",
+                    },
+                    json=payload,
+                )
+            logger.info("[extract-metadata] ← Qwen-VL 响应 status=%d 耗时=%.2fs",
+                        resp.status_code, time.time() - t0)
             resp.raise_for_status()
+        except httpx.TimeoutException:
+            logger.error("[extract-metadata] ✗ Qwen-VL 超时（90s） 耗时=%.2fs", time.time() - t0)
+            raise
+        except httpx.HTTPStatusError as e:
+            logger.error("[extract-metadata] ✗ Qwen-VL HTTP错误 status=%d body=%s",
+                         e.response.status_code, e.response.text[:300])
+            raise
 
         content = resp.json()["choices"][0]["message"]["content"]
+        logger.info("[extract-metadata] 模型回复长度=%d chars", len(content))
 
         match = re.search(r"\{[\s\S]*\}", content)
         if not match:

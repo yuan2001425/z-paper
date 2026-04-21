@@ -81,6 +81,11 @@ Annotation search strategy:
 - When calling search_annotations, pass specific names/keywords, NOT the full sentence.
 - Annotations may be in Chinese, English, OR pinyin. For Chinese names, also try pinyin.
 - Run search_annotations for each important entity in the user's question.
+
+Image tool rules:
+- When a visual diagram, concept map, or process flow would help the user understand something, proactively call generate_image with a detailed prompt (include content, layout, style, colors, in both Chinese and English). After generating, embed the result as ![description](image_url) in your answer.
+- Only call edit_image when the user explicitly asks to modify a previously generated image. Pass the exact image_url from the prior generate_image result.
+- image_url from tool results is in /uploads/chat_generated/xxx.jpg format — use it directly in Markdown image syntax.
 """
 
 

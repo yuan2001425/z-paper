@@ -23,6 +23,7 @@ class Settings(BaseSettings):
     QWEN_BASE_URL: str = "https://dashscope.aliyuncs.com/compatible-mode/v1"
     QWEN_VL_MODEL: str = "qwen3-vl-flash"
     QWEN_IMAGE_MODEL: str = "qwen-image-2.0-pro"
+    QWEN_IMAGE_GEN_MODEL: str = "qwen-image-2.0"
     QWEN_TEXT_MODEL: str = "qwen3.5-flash"
     QWEN_DASHSCOPE_BASE_URL: str = "https://dashscope.aliyuncs.com/api/v1"
 

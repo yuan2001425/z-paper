@@ -69,6 +69,50 @@
         </div>
       </el-card>
 
+      <!-- 重复论文检测弹窗 -->
+      <el-dialog
+        v-model="duplicateDialog.visible"
+        title="发现相似论文"
+        width="640px"
+        :close-on-click-modal="false"
+      >
+        <p style="color:#606266;margin-bottom:16px">
+          库中已有以下相似论文，请确认是否仍需继续上传：
+        </p>
+        <div
+          v-for="p in duplicateDialog.list"
+          :key="p.paper_id"
+          style="border:1px solid #ebeef5;border-radius:6px;padding:12px 16px;margin-bottom:10px"
+        >
+          <div style="display:flex;justify-content:space-between;align-items:flex-start;gap:12px">
+            <div style="flex:1;min-width:0">
+              <div style="font-weight:500;word-break:break-all">{{ p.title }}</div>
+              <div v-if="p.title_zh" style="color:#909399;font-size:0.85rem;margin-top:2px">{{ p.title_zh }}</div>
+              <div style="color:#909399;font-size:0.82rem;margin-top:4px">
+                {{ p.journal || '—' }}{{ p.year ? '  ' + p.year : '' }}
+              </div>
+            </div>
+            <div style="display:flex;flex-direction:column;align-items:flex-end;gap:6px;flex-shrink:0">
+              <el-tag :type="p.similarity >= 0.85 ? 'danger' : 'warning'" size="small">
+                相似度 {{ Math.round(p.similarity * 100) }}%
+              </el-tag>
+              <a
+                v-if="p.pdf_url"
+                :href="p.pdf_url"
+                target="_blank"
+                style="font-size:0.82rem;color:#409eff;text-decoration:none"
+              >查看 PDF</a>
+            </div>
+          </div>
+        </div>
+        <template #footer>
+          <el-button @click="duplicateDialog.visible = false; step = 0">取消上传</el-button>
+          <el-button type="primary" @click="duplicateDialog.visible = false; step = 1">
+            仍然继续上传
+          </el-button>
+        </template>
+      </el-dialog>
+
       <!-- 步骤2：填写元数据 -->
       <el-card v-if="step === 1">
         <el-alert
@@ -241,6 +285,7 @@ const file = ref(null)
 const uploading = ref(false)
 const extracting = ref(false)
 const extractedAuto = ref(false)
+const duplicateDialog = ref({ visible: false, list: [] })
 
 const meta = ref({
   title: '',
@@ -315,6 +360,7 @@ async function goToStep2() {
     formData.append('paper_type', meta.value.paper_type)
     const res = await api.post('/papers/extract-metadata', formData, {
       headers: { 'Content-Type': 'multipart/form-data' },
+      timeout: 120000,
     })
     const d = res.data
     if (d.title) { meta.value.title = d.title; extractedAuto.value = true }
@@ -323,16 +369,31 @@ async function goToStep2() {
     if (d.year) meta.value.year = parseInt(d.year) || meta.value.year
     if (d.doi) meta.value.doi = d.doi
     if (d.source_language) meta.value.source_language = d.source_language
-    // division_tags 已是数组，直接赋给 el-select multiple 的 v-model
     if (Array.isArray(d.division_tags) && d.division_tags.length > 0) {
       meta.value.divisionTags = d.division_tags
     }
   } catch {
-    // 提取失败静默处理，用户手动填写
+    // 提取失败静默处理
   } finally {
     extracting.value = false
-    step.value = 1
   }
+
+  // 重复检测（有标题才检测）
+  if (meta.value.title || meta.value.title_zh) {
+    try {
+      const res = await api.post('/papers/check-duplicate', {
+        title: meta.value.title,
+        title_zh: meta.value.title_zh,
+      })
+      if (res.data.duplicates?.length > 0) {
+        duplicateDialog.value = { visible: true, list: res.data.duplicates }
+        return  // 等用户在弹窗里决定
+      }
+    } catch {
+      // 检测失败不阻断流程
+    }
+  }
+  step.value = 1
 }
 
 async function submit() {

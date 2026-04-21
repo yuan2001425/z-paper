@@ -63,7 +63,7 @@
                 <div class="tool-steps-header" @click="toggleSteps(msg.id)">
                   <el-icon class="steps-arrow"><ArrowRight /></el-icon>
                   <span>
-                    查询了 {{ toolSummary(msg.tool_calls) }}
+                    使用了 {{ toolSummary(msg.tool_calls) }}
                     <span v-if="msg.isStreaming && msg.tool_calls.some(t => t.running)" class="tool-running-badge">运行中…</span>
                   </span>
                 </div>
@@ -78,7 +78,7 @@
               </div>
 
               <!-- 回答正文（Markdown 简单渲染） + 流式光标 -->
-              <div v-if="msg.content" class="ai-answer">
+              <div v-if="msg.content" class="ai-answer" @click.capture="onAnswerClick">
                 <span v-html="renderAnswer(msg.content)" />
                 <span v-if="msg.isStreaming" class="stream-cursor" />
               </div>
@@ -121,6 +121,25 @@
                 </div>
               </div>
             </div>
+          </div>
+        </div>
+
+        <!-- 图片编辑面板 -->
+        <div v-if="editingImage.url" class="edit-panel">
+          <div class="edit-panel-header">
+            <span>✏ 正在编辑图片 &nbsp;<em>{{ editingImage.url.split('/').pop() }}</em></span>
+            <el-button size="small" text @click="editingImage.url = ''">✕ 取消</el-button>
+          </div>
+          <div class="edit-panel-body">
+            <el-input
+              v-model="editingImage.instruction"
+              type="textarea"
+              :rows="2"
+              placeholder="描述你想要的修改…"
+              resize="none"
+              @keydown.ctrl.enter.prevent="sendEditImage"
+            />
+            <el-button type="primary" size="small" @click="sendEditImage">发送编辑</el-button>
           </div>
         </div>
 
@@ -173,6 +192,36 @@
       </aside>
 
     </div>
+
+    <!-- 图片查看弹窗 -->
+    <el-dialog v-model="imageViewer.visible" width="80%" :close-on-click-modal="true" align-center @close="resetZoom">
+      <div
+        class="img-zoom-wrap"
+        @wheel.prevent="onImgWheel"
+        @mousedown="onImgMousedown"
+        @mousemove="onImgMousemove"
+        @mouseup="onImgMouseup"
+        @mouseleave="onImgMouseup"
+      >
+        <img
+          :src="imageViewer.url"
+          class="img-zoom-img"
+          :style="{
+            transform: `scale(${imgZoom.scale}) translate(${imgZoom.tx}px, ${imgZoom.ty}px)`,
+            cursor: imgZoom.dragging ? 'grabbing' : (imgZoom.scale > 1 ? 'grab' : 'default'),
+          }"
+        />
+        <div class="img-zoom-hint" v-if="imgZoom.scale !== 1">{{ Math.round(imgZoom.scale * 100) }}%</div>
+      </div>
+      <template #footer>
+        <div class="img-dialog-footer">
+          <a :href="imageViewer.url" :download="imageViewer.url.split('/').pop()">
+            <el-button>下载</el-button>
+          </a>
+          <el-button type="primary" @click="startEditImage">编辑图片</el-button>
+        </div>
+      </template>
+    </el-dialog>
   </div>
 
 </template>
@@ -198,6 +247,10 @@ const paperTitles      = reactive({}) // paper_id → title cache
 
 const expandedSteps     = reactive({})
 const expandedCitations = reactive({})
+
+const imageViewer  = ref({ visible: false, url: '' })
+const editingImage = ref({ url: '', instruction: '' })
+const imgZoom      = reactive({ scale: 1, tx: 0, ty: 0, dragging: false, lastX: 0, lastY: 0 })
 
 // ── Minimap ────────────────────────────────────────────────────────────────────
 const mmContentRef        = ref(null)
@@ -387,6 +440,58 @@ function fillInput(text) {
   inputText.value = text
 }
 
+function onAnswerClick(e) {
+  const img = e.target.closest('img')
+  if (!img) return
+  e.preventDefault()
+  resetZoom()
+  imageViewer.value.url = img.src
+  imageViewer.value.visible = true
+}
+
+function resetZoom() {
+  imgZoom.scale = 1; imgZoom.tx = 0; imgZoom.ty = 0; imgZoom.dragging = false
+}
+
+function onImgWheel(e) {
+  const delta = e.deltaY > 0 ? -0.15 : 0.15
+  imgZoom.scale = Math.min(5, Math.max(0.5, imgZoom.scale + delta))
+  if (imgZoom.scale <= 1) { imgZoom.tx = 0; imgZoom.ty = 0 }
+}
+
+function onImgMousedown(e) {
+  if (imgZoom.scale <= 1) return
+  imgZoom.dragging = true
+  imgZoom.lastX = e.clientX
+  imgZoom.lastY = e.clientY
+}
+
+function onImgMousemove(e) {
+  if (!imgZoom.dragging) return
+  imgZoom.tx += (e.clientX - imgZoom.lastX) / imgZoom.scale
+  imgZoom.ty += (e.clientY - imgZoom.lastY) / imgZoom.scale
+  imgZoom.lastX = e.clientX
+  imgZoom.lastY = e.clientY
+}
+
+function onImgMouseup() {
+  imgZoom.dragging = false
+}
+
+function startEditImage() {
+  editingImage.value.url = imageViewer.value.url
+  editingImage.value.instruction = ''
+  imageViewer.value.visible = false
+}
+
+function sendEditImage() {
+  if (!editingImage.value.instruction.trim()) return
+  inputText.value = `请编辑图片(${editingImage.value.url})：${editingImage.value.instruction}`
+  editingImage.value.url = ''
+  editingImage.value.instruction = ''
+  sendMessage()
+}
+
 // ── UI helpers ────────────────────────────────────────────────────────────────
 
 function scrollToBottom() {
@@ -423,6 +528,8 @@ function toolLabel(name) {
     get_paper_metadata:    '获取论文信息',
     search_chat_history:   '搜索历史对话',
     query_database:        '数据库查询',
+    generate_image:        '生成图片',
+    edit_image:            '编辑图片',
   }
   return map[name] || name
 }
@@ -702,6 +809,79 @@ onUnmounted(() => {
 .ai-answer :deep(table) { border-collapse: collapse; width: 100%; margin: 0.5em 0; font-size: 0.88em; }
 .ai-answer :deep(th), .ai-answer :deep(td) { border: 1px solid #e4e7ed; padding: 5px 10px; text-align: left; }
 .ai-answer :deep(th) { background: #f5f7fa; font-weight: 600; }
+
+/* 图片样式 */
+.ai-answer :deep(img) {
+  max-width: 50%;
+  border-radius: 8px;
+  cursor: zoom-in;
+  margin: 8px auto;
+  display: block;
+  box-shadow: 0 2px 8px rgba(0,0,0,0.12);
+  transition: opacity 0.15s;
+}
+.ai-answer :deep(img:hover) { opacity: 0.88; }
+
+/* 图片查看器弹窗 */
+.img-zoom-wrap {
+  position: relative;
+  overflow: hidden;
+  background: #1a1a1a;
+  border-radius: 6px;
+  max-height: 70vh;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  user-select: none;
+}
+.img-zoom-img {
+  max-width: 100%;
+  max-height: 70vh;
+  object-fit: contain;
+  display: block;
+  transform-origin: center center;
+  transition: transform 0.05s;
+  border-radius: 0;
+}
+.img-zoom-hint {
+  position: absolute;
+  bottom: 8px;
+  right: 10px;
+  background: rgba(0,0,0,0.55);
+  color: #fff;
+  font-size: 0.75rem;
+  padding: 2px 7px;
+  border-radius: 10px;
+  pointer-events: none;
+}
+.img-dialog-footer {
+  display: flex;
+  justify-content: flex-end;
+  gap: 16px;
+}
+
+/* 图片编辑面板 */
+.edit-panel {
+  border-top: 1px solid #e4e7ed;
+  background: #fef9ec;
+  padding: 10px 24px 8px;
+  flex-shrink: 0;
+}
+.edit-panel-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  font-size: 0.82rem;
+  color: #606266;
+  margin-bottom: 8px;
+}
+.edit-panel-header em { color: #409eff; font-style: normal; }
+.edit-panel-body {
+  display: flex;
+  gap: 8px;
+  align-items: flex-end;
+}
+.edit-panel-body .el-textarea { flex: 1; }
 
 /* 引用区 */
 .citations-block { margin-top: 10px; border-top: 1px solid #f0f0f0; padding-top: 8px; }

@@ -3,7 +3,7 @@
     <div class="header-inner">
       <div class="logo" @click="$router.push('/')">z-paper</div>
       <nav class="nav">
-        <el-link @click="$router.push('/')">我的论文库</el-link>
+        <el-link @click="$router.push('/search')">我的论文库</el-link>
         <el-link @click="uploadModal?.open()">上传论文</el-link>
         <el-link @click="$router.push('/jobs')">处理进度</el-link>
         <el-link @click="$router.push('/glossary')">专有名词</el-link>
