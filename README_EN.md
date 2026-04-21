@@ -1,6 +1,5 @@
 <div align="center">
   <img src="icon.svg" width="96" alt="z-paper logo" />
-  <h1>z-paper</h1>
   <p>A locally-deployed academic paper translation and AI knowledge base chat tool, designed for individual researchers.</p>
   <p>中文 | <a href="README.md">English</a></p>
 </div>

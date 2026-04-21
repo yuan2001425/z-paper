@@ -1,6 +1,5 @@
 <div align="center">
   <img src="icon.svg" width="96" alt="z-paper logo" />
-  <h1>z-paper</h1>
   <p>本地部署的学术论文精准翻译与 AI 知识库对话工具，专为个人研究者设计。</p>
   <p><a href="README_EN.md">English</a> | 中文</p>
 </div>
