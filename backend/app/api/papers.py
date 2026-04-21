@@ -220,11 +220,13 @@ def search_papers(
     q: str = Query(default=""),
     year: int = Query(default=None),
     paper_type: str = Query(default=None),
+    folder_id: Optional[int] = Query(default=None),
+    unclassified: bool = Query(default=False),
     page: int = Query(default=1, ge=1),
     page_size: int = Query(default=20, le=100),
     db: Session = Depends(get_db),
 ):
-    """搜索个人论文库"""
+    """搜索个人论文库。folder_id=N 只返回该文件夹内论文；unclassified=true 只返回未分类论文。"""
     query = db.query(Paper)
     if q:
         query = query.filter(
@@ -234,6 +236,16 @@ def search_papers(
         query = query.filter(Paper.year == year)
     if paper_type:
         query = query.filter(Paper.paper_type == paper_type)
+    if folder_id is not None:
+        from app.models.folder import PaperFolderMapping
+        subq = db.query(PaperFolderMapping.paper_id).filter(
+            PaperFolderMapping.folder_id == folder_id
+        )
+        query = query.filter(Paper.id.in_(subq))
+    elif unclassified:
+        from app.models.folder import PaperFolderMapping
+        mapped_subq = db.query(PaperFolderMapping.paper_id).distinct()
+        query = query.filter(~Paper.id.in_(mapped_subq))
 
     total = query.count()
     items = query.order_by(Paper.created_at.desc()).offset((page - 1) * page_size).limit(page_size).all()

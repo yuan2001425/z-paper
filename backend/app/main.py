@@ -10,7 +10,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
 
 from app.config import settings, load_db_config
-from app.api import papers, jobs, results, glossary, domain_glossary, chat
+from app.api import papers, jobs, results, glossary, domain_glossary, chat, folders
 from app.api import settings as settings_api
 
 app = FastAPI(title="z-paper API", version="0.2.0")
@@ -58,6 +58,7 @@ app.include_router(glossary.router, prefix="/api/v1/glossary", tags=["glossary"]
 app.include_router(domain_glossary.router, prefix="/api/v1/domain-glossary", tags=["domain-glossary"])
 app.include_router(chat.router, prefix="/api/v1/chat", tags=["chat"])
 app.include_router(settings_api.router, prefix="/api/v1/settings", tags=["settings"])
+app.include_router(folders.router, prefix="/api/v1/folders", tags=["folders"])
 
 
 _TERMINAL_STATUSES = {"completed", "failed", "waiting_term_review"}

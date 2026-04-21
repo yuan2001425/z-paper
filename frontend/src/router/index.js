@@ -23,6 +23,11 @@ const routes = [
     meta: { title: '上传翻译' }
   },
   {
+    path: '/batch-upload',
+    component: () => import('@/views/BatchUpload.vue'),
+    meta: { title: '批量上传' }
+  },
+  {
     path: '/upload-chinese',
     component: () => import('@/views/ChineseUpload.vue'),
     meta: { title: '上传中文论文' }
