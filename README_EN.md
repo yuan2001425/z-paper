@@ -8,6 +8,24 @@ All data is stored locally. No external database or message queue required.
 
 ---
 
+## Screenshots
+
+<table>
+  <tr>
+    <td><img src="images/Snipaste_2026-04-22_03-03-35.png" alt="Home"/><br/><sub>Home</sub></td>
+    <td><img src="images/Snipaste_2026-04-22_03-02-11.png" alt="Paper library with virtual folders"/><br/><sub>Paper Library · Virtual Folders</sub></td>
+  </tr>
+  <tr>
+    <td><img src="images/Snipaste_2026-04-22_03-02-34.png" alt="Bilingual reading view"/><br/><sub>Bilingual Reading View</sub></td>
+    <td><img src="images/Snipaste_2026-04-22_03-02-49.png" alt="LaTeX formula rendering"/><br/><sub>LaTeX Formula Rendering</sub></td>
+  </tr>
+  <tr>
+    <td colspan="2"><img src="images/Snipaste_2026-04-22_03-03-24.png" alt="AI chat with image generation"/><br/><sub>AI Knowledge Base Chat · Image Generation</sub></td>
+  </tr>
+</table>
+
+---
+
 ## Installation (Windows)
 
 > ⚠️ **The Baidu Netdisk installer is outdated and no longer maintained.**  

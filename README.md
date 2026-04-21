@@ -8,6 +8,24 @@
 
 ---
 
+## 截图
+
+<table>
+  <tr>
+    <td><img src="images/Snipaste_2026-04-22_03-03-35.png" alt="主页"/><br/><sub>主页</sub></td>
+    <td><img src="images/Snipaste_2026-04-22_03-02-11.png" alt="论文库与虚拟文件夹"/><br/><sub>论文库 · 虚拟文件夹</sub></td>
+  </tr>
+  <tr>
+    <td><img src="images/Snipaste_2026-04-22_03-02-34.png" alt="双栏译文阅读"/><br/><sub>双栏译文阅读</sub></td>
+    <td><img src="images/Snipaste_2026-04-22_03-02-49.png" alt="公式渲染"/><br/><sub>LaTeX 公式渲染</sub></td>
+  </tr>
+  <tr>
+    <td colspan="2"><img src="images/Snipaste_2026-04-22_03-03-24.png" alt="AI 知识库对话与图片生成"/><br/><sub>AI 知识库对话 · 图片生成</sub></td>
+  </tr>
+</table>
+
+---
+
 ## 下载安装（Windows）
 
 > ⚠️ **百度网盘的安装包版本已过时，不再维护，功能远落后于当前版本。**  
