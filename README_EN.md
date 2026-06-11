@@ -68,6 +68,7 @@ Most translation tools translate terminology randomly, causing the same term to 
 - Image lightbox with original vs. translated comparison
 - In-text citations `[1]` clickable, jump to reference list
 - Paragraph-level annotation system
+- **One-click DOCX export**: three modes (original / translation / original+translation), auto-embed images, LaTeX formulas rendered as native Word math equations (OMML), narrow margins for compact layout
 
 ---
 
@@ -193,6 +194,9 @@ All data is stored entirely on your machine: `backend/data/zpaper.db` (database)
 ---
 
 ## Changelog
+
+### v1.3.0
+- **DOCX export**: one-click export from reading view; three modes (original / translation / original+translation); auto-embeds images and renders LaTeX as native Word math equations (OMML); narrow margins for compact layout; filename auto-labeled `{Chinese title}(mode).docx`
 
 ### v1.2.0
 - **Virtual folders**: multi-level paper organization (up to 3 levels), tree navigation, batch move; delete with "keep papers" or "delete files" strategy

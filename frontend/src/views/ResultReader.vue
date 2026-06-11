@@ -9,15 +9,35 @@
           <el-radio-button value="single">单栏</el-radio-button>
         </el-radio-group>
         <span v-else style="font-size:0.85rem;color:#909399">中文论文 · 单列阅读</span>
-        <el-button
-          v-if="result?.pdf_url"
-          type="primary"
-          size="small"
-          :icon="Document"
-          @click="openPdf"
-        >
-          查看原文 PDF
-        </el-button>
+        <div class="toolbar-right">
+          <el-dropdown v-if="result" trigger="click" @command="handleExport">
+            <el-button type="primary" size="small" :icon="Download">
+              导出 <el-icon class="el-icon--right"><ArrowDown /></el-icon>
+            </el-button>
+            <template #dropdown>
+              <el-dropdown-menu>
+                <el-dropdown-item command="original">
+                  <el-icon><Document /></el-icon> 导出原文
+                </el-dropdown-item>
+                <el-dropdown-item command="both" v-if="!chineseMode">
+                  <el-icon><DocumentCopy /></el-icon> 导出原文 + 译文
+                </el-dropdown-item>
+                <el-dropdown-item command="translation" v-if="!chineseMode">
+                  <el-icon><Memo /></el-icon> 导出译文
+                </el-dropdown-item>
+              </el-dropdown-menu>
+            </template>
+          </el-dropdown>
+          <el-button
+            v-if="result?.pdf_url"
+            type="primary"
+            size="small"
+            :icon="Document"
+            @click="openPdf"
+          >
+            查看原文 PDF
+          </el-button>
+        </div>
       </div>
 
       <div class="reader-body">
@@ -81,7 +101,7 @@
 <script setup>
 import { ref, onMounted, computed, nextTick } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
-import { ArrowRight, Document } from '@element-plus/icons-vue'
+import { ArrowRight, Document, Download, ArrowDown, DocumentCopy, Memo } from '@element-plus/icons-vue'
 import { ElMessage } from 'element-plus'
 import api from '@/api/index.js'
 import AppHeader from '@/components/AppHeader.vue'
@@ -172,6 +192,19 @@ function onAddAnnotation(info) {
 function openPdf() {
   if (result.value?.pdf_url) window.open(result.value.pdf_url, '_blank')
 }
+
+function handleExport(mode) {
+  if (!result.value?.id) return
+  const url = `/api/v1/results/${result.value.id}/export?mode=${mode}`
+  // 通过创建临时 a 标签触发浏览器下载
+  const a = document.createElement('a')
+  a.href = url
+  a.download = ''
+  document.body.appendChild(a)
+  a.click()
+  document.body.removeChild(a)
+  ElMessage.success('正在导出...')
+}
 </script>
 
 <style scoped>
@@ -190,6 +223,7 @@ function openPdf() {
   border-bottom: 1px solid #e4e7ed;
   box-shadow: 0 2px 8px rgba(0,0,0,0.06);
 }
+.toolbar-right { display: flex; align-items: center; gap: 8px; }
 .reader-body { display: grid; grid-template-columns: 1fr 300px; gap: 24px; align-items: start; }
 .content-area { padding-right: 32px; min-width: 0; overflow-x: hidden; }
 
