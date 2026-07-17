@@ -32,6 +32,8 @@ from app.translation.pipeline_core import (
     extract_terms_chunk,
     classify_chunk,
     verify_references,
+    build_document_memory,
+    build_translation_context,
     translate_paragraph,
     normalize_display_math,
 )
@@ -271,6 +273,20 @@ def run_phase_d_to_g(job_id: str):
 
         # ── D：段落翻译 ──────────────────────────────────────────────────────
         _push(job_id, JobStatus.TRANSLATING, 60, "开始逐段翻译...")
+        document_memory = build_document_memory(
+            flat_objects,
+            glossary_list=glossary_list,
+            domain=domain_label,
+        )
+        logger.warning(
+            "[pipeline] document memory ready: outline=%d sections=%d acronyms=%d symbols=%d phrases=%d",
+            len(document_memory.get("outline", [])),
+            len(document_memory.get("sections", [])),
+            len(document_memory.get("acronyms", [])),
+            len(document_memory.get("symbols", [])),
+            len(document_memory.get("recurring_phrases", [])),
+        )
+
         translatable_indices = [
             i for i, obj in enumerate(flat_objects)
             if obj.get("type") in ("heading", "paragraph")
@@ -281,7 +297,14 @@ def run_phase_d_to_g(job_id: str):
 
         def _translate_worker(idx: int):
             obj = flat_objects[idx]
-            zh = translate_paragraph(obj["text"], glossary_list, domain=domain_label, para_idx=idx)
+            context = build_translation_context(flat_objects, idx, document_memory, window=1)
+            zh = translate_paragraph(
+                obj["text"],
+                glossary_list,
+                domain=domain_label,
+                para_idx=idx,
+                context=context,
+            )
             return idx, zh
 
         with ThreadPoolExecutor(max_workers=8) as executor:
@@ -367,6 +390,7 @@ def run_phase_d_to_g(job_id: str):
             "年份": str(year) if year else "",
             "期刊/会议分类标签": division_tags,
             "DOI": doi,
+            "文档记忆": document_memory,
             "正文": zhengwen,
             "参考文献": deduped_references,
         }

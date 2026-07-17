@@ -12,6 +12,7 @@ pipeline_core.py — 论文翻译流水线核心函数
 import json
 import logging
 import re
+from collections import Counter
 
 import httpx
 
@@ -735,11 +736,203 @@ def verify_references(objects: list[dict], chunk_idx: int = 0) -> list[dict]:
 
 # ── 阶段 D：段落翻译 ──────────────────────────────────────────────────────────
 
+# ── 文档级记忆：为超长文档翻译提供稳定锚点 ───────────────────────────────────────
+
+_COMMON_ACRONYMS = {
+    "PDF", "DOI", "URL", "HTTP", "DNA", "RNA", "ATP", "AI", "ML", "LLM",
+    "USA", "UK", "WHO", "UN", "EU", "IEEE", "ACM",
+}
+
+
+def _clip_text(text: str, limit: int = 500) -> str:
+    text = re.sub(r"\s+", " ", (text or "")).strip()
+    if len(text) <= limit:
+        return text
+    return text[:limit].rsplit(" ", 1)[0] + "..."
+
+
+def _extract_acronyms(text: str) -> list[dict]:
+    """提取类似 polymerase chain reaction (PCR) 的缩写定义。"""
+    items: dict[str, str] = {}
+    pattern = re.compile(r"([A-Za-z][A-Za-z0-9,\-/ ]{3,80}?)\s*\(([A-Z][A-Z0-9\-]{1,12})\)")
+    for full, abbr in pattern.findall(text or ""):
+        if abbr in _COMMON_ACRONYMS:
+            continue
+        full = re.sub(r"\s+", " ", full).strip(" ,;:")
+        if len(full) >= 4:
+            items.setdefault(abbr, full)
+    return [{"abbr": abbr, "definition": full} for abbr, full in sorted(items.items())[:80]]
+
+
+def _extract_symbols(text: str) -> list[str]:
+    symbols = set()
+    for token in re.findall(r"\$([^$]{1,80})\$", text or ""):
+        if re.search(r"[A-Za-z\\]", token):
+            symbols.add(token.strip())
+    for token in re.findall(r"\b[A-Za-z][A-Za-z0-9]*[_^][A-Za-z0-9{}\\]+\b", text or ""):
+        symbols.add(token.strip())
+    return sorted(symbols, key=lambda s: (len(s), s))[:80]
+
+
+def _extract_recurring_phrases(text: str) -> list[str]:
+    words = re.findall(r"\b[A-Za-z][A-Za-z-]{2,}\b", text or "")
+    stop = {
+        "the", "and", "for", "with", "from", "that", "this", "were", "are",
+        "was", "into", "than", "then", "have", "has", "had", "using", "used",
+        "between", "among", "paper", "study", "result", "results", "method",
+        "methods", "analysis", "figure", "table", "section", "data",
+    }
+    grams = []
+    for n in (2, 3):
+        for i in range(len(words) - n + 1):
+            gram_words = words[i:i + n]
+            if any(w.lower() in stop for w in gram_words):
+                continue
+            grams.append(" ".join(gram_words))
+    counts = Counter(p.lower() for p in grams)
+    original = {}
+    for phrase in grams:
+        original.setdefault(phrase.lower(), phrase)
+    return [original[k] for k, c in counts.most_common(60) if c >= 2]
+
+
+def build_document_memory(
+    objects: list[dict],
+    glossary_list: list[dict] | None = None,
+    domain: str = "学术",
+) -> dict:
+    """
+    在结构分类之后构建可复用的文档级记忆。
+
+    这一步不改 PDF 识别和结构分类结果，只保存大纲、章节上下文、缩写、符号、
+    高频候选概念等稳定信息，供后续段落翻译按需注入。
+    """
+    heading_stack: list[str] = []
+    outline: list[dict] = []
+    sections: list[dict] = []
+    current_section: dict | None = None
+    all_text_parts: list[str] = []
+
+    for idx, obj in enumerate(objects):
+        obj_type = obj.get("type")
+        if obj_type == "heading":
+            level = int(obj.get("level") or 1)
+            text = obj.get("text", "").strip()
+            heading_stack = heading_stack[:max(level - 1, 0)]
+            heading_stack.append(text)
+            path = " > ".join(h for h in heading_stack if h)
+            outline.append({"index": idx, "level": level, "text": text, "path": path})
+            if current_section:
+                current_section["end_index"] = idx - 1
+            current_section = {
+                "start_index": idx,
+                "end_index": len(objects) - 1,
+                "heading": text,
+                "path": path,
+                "snippets": [],
+            }
+            sections.append(current_section)
+        elif obj_type == "paragraph":
+            text = obj.get("text", "").strip()
+            if text:
+                all_text_parts.append(text)
+                if current_section and len(current_section["snippets"]) < 4:
+                    current_section["snippets"].append(_clip_text(text, 260))
+
+    full_text = "\n".join(all_text_parts)
+    full_sample = "\n".join(all_text_parts[:1200])
+    glossary_terms = []
+    if glossary_list:
+        lowered = full_text.lower()
+        for term in glossary_list:
+            en = (term.get("en") or "").strip()
+            if en and en.lower() in lowered:
+                glossary_terms.append({
+                    "en": en,
+                    "zh": term.get("zh") or "",
+                    "status": term.get("status", "translate"),
+                })
+
+    for section in sections:
+        section["summary"] = _clip_text(" ".join(section.pop("snippets", [])), 700)
+
+    return {
+        "version": 1,
+        "domain": domain,
+        "outline": outline[:120],
+        "sections": sections[:120],
+        "acronyms": _extract_acronyms(full_sample),
+        "symbols": _extract_symbols(full_text),
+        "recurring_phrases": _extract_recurring_phrases(full_text),
+        "glossary_terms": glossary_terms[:120],
+    }
+
+
+def build_translation_context(
+    objects: list[dict],
+    idx: int,
+    document_memory: dict | None,
+    window: int = 1,
+) -> str:
+    """为单段翻译生成紧凑上下文，避免把整篇文章塞进 prompt。"""
+    if not document_memory:
+        return ""
+
+    current_section = None
+    for section in document_memory.get("sections", []):
+        if section.get("start_index", 0) <= idx <= section.get("end_index", 0):
+            current_section = section
+            break
+
+    parts = []
+    if current_section:
+        parts.append(f"Current section: {current_section.get('path') or current_section.get('heading')}")
+        if current_section.get("summary"):
+            parts.append(f"Section gist: {current_section['summary']}")
+
+    neighbor_lines = []
+    for j in range(max(0, idx - window), min(len(objects), idx + window + 1)):
+        if j == idx:
+            continue
+        obj = objects[j]
+        if obj.get("type") in ("heading", "paragraph") and obj.get("text"):
+            label = "Previous" if j < idx else "Next"
+            neighbor_lines.append(f"{label}: {_clip_text(obj.get('text', ''), 280)}")
+    if neighbor_lines:
+        parts.append("Nearby context:\n" + "\n".join(neighbor_lines))
+
+    target_text = (objects[idx].get("text") or "").lower() if 0 <= idx < len(objects) else ""
+    relevant_acronyms = [
+        f"{a['abbr']} = {a['definition']}"
+        for a in document_memory.get("acronyms", [])
+        if a.get("abbr", "").lower() in target_text
+    ][:12]
+    if relevant_acronyms:
+        parts.append("Document abbreviations:\n" + "\n".join(relevant_acronyms))
+
+    relevant_symbols = [
+        s for s in document_memory.get("symbols", [])
+        if s.lower().strip("$") in target_text
+    ][:12]
+    if relevant_symbols:
+        parts.append("Document symbols/formulas to preserve consistently:\n" + ", ".join(relevant_symbols))
+
+    relevant_phrases = [
+        p for p in document_memory.get("recurring_phrases", [])
+        if p.lower() in target_text
+    ][:12]
+    if relevant_phrases:
+        parts.append("Recurring document concepts:\n" + "; ".join(relevant_phrases))
+
+    return "\n\n".join(parts)
+
+
 def translate_paragraph(
     text: str,
     glossary_list: list[dict],
     domain: str = "学术",
     para_idx: int = 0,
+    context: str | None = None,
 ) -> str:
     """
     阶段 D：翻译单个段落或标题，返回中文字符串。
@@ -767,6 +960,7 @@ def translate_paragraph(
         glossary_parts.append(f"[TRANSLATE + ANNOTATE — render as 'Chinese（English）', strictly this format]\n{lines}")
 
     glossary_text = "\n\n".join(glossary_parts) if glossary_parts else "(No custom glossary applies to this passage.)"
+    context_text = (context or "").strip() or "(No additional document context.)"
 
     messages = [
         {
@@ -782,6 +976,10 @@ def translate_paragraph(
                 f"Translate the following {domain} academic paper passage into Chinese.\n\n"
                 "=== CUSTOM GLOSSARY (highest priority — follow strictly) ===\n"
                 f"{glossary_text}\n\n"
+                "=== DOCUMENT MEMORY FOR CONSISTENCY ===\n"
+                "Use this only to resolve terminology, abbreviations, symbols, pronouns, and local continuity. "
+                "Do not translate content that is not present in the passage.\n"
+                f"{context_text}\n\n"
                 "=== GENERAL TRANSLATION RULES ===\n"
                 "- URLs, DOIs, and personal names: keep in original language\n"
                 "- LaTeX formulas $...$ and $$...$$ : preserve exactly, do not modify\n"

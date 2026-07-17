@@ -195,6 +195,9 @@ All data is stored entirely on your machine: `backend/data/zpaper.db` (database)
 
 ## Changelog
 
+### v1.4.0
+- **Long-document translation memory**: builds a compact per-document memory after structure analysis, including the outline, section context, abbreviations, symbols, recurring concepts, and applicable glossary entries. Each paragraph translation now receives only the relevant local context, improving terminology consistency and cross-section continuity without changing PDF parsing.
+
 ### v1.3.0
 - **DOCX export**: one-click export from reading view; three modes (original / translation / original+translation); auto-embeds images and renders LaTeX as native Word math equations (OMML); narrow margins for compact layout; filename auto-labeled `{Chinese title}(mode).docx`
 
