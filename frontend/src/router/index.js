@@ -38,6 +38,11 @@ const routes = [
     meta: { title: '翻译任务' }
   },
   {
+    path: '/long-documents/:paperId',
+    component: () => import('@/views/LongDocumentSplit.vue'),
+    meta: { title: '长文档分章' }
+  },
+  {
     path: '/glossary',
     component: () => import('@/views/UserGlossary.vue'),
     meta: { title: '专有名词库' }

@@ -48,6 +48,31 @@ with engine.connect() as _conn:
             pass  # 列已存在时 SQLite 会报错，直接忽略
     _conn.commit()
 
+with engine.connect() as _conn:
+    for _table, _cols in {
+        "papers": [
+            ("document_role", "VARCHAR(20) DEFAULT 'normal'"),
+            ("parent_paper_id", "VARCHAR(36)"),
+            ("chapter_index", "INTEGER"),
+            ("chapter_title", "VARCHAR(300)"),
+            ("start_page", "INTEGER"),
+            ("end_page", "INTEGER"),
+        ],
+        "translation_jobs": [
+            ("parent_job_id", "VARCHAR(36)"),
+            ("chapter_index", "INTEGER"),
+            ("total_chapters", "INTEGER"),
+        ],
+    }.items():
+        for _col, _def in _cols:
+            try:
+                _conn.execute(_sql_text(
+                    f"ALTER TABLE {_table} ADD COLUMN {_col} {_def}"
+                ))
+            except Exception:
+                pass
+    _conn.commit()
+
 load_db_config()   # 用 DB 里保存的 key 覆盖内存配置（.env 缺失时依然生效）
 app.mount("/uploads", StaticFiles(directory=settings.LOCAL_UPLOAD_PATH), name="uploads")
 

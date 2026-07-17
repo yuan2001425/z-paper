@@ -17,6 +17,12 @@ class PaperResponse(BaseModel):
     division: Optional[str]
     source_language: Optional[str]
     domain: Optional[str]
+    document_role: Optional[str] = "normal"
+    parent_paper_id: Optional[str] = None
+    chapter_index: Optional[int] = None
+    chapter_title: Optional[str] = None
+    start_page: Optional[int] = None
+    end_page: Optional[int] = None
     page_count: Optional[int]
     created_at: datetime
 

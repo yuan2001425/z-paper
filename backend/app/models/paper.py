@@ -23,6 +23,12 @@ class Paper(Base):
     division = Column(String(500))           # 分区标签，多个用顿号分隔
     source_language = Column(String(20), nullable=False, server_default='en')
     domain = Column(String(100), nullable=True)
+    document_role = Column(String(20), nullable=False, server_default='normal')  # normal | long_parent | long_chapter
+    parent_paper_id = Column(String(36), nullable=True, index=True)
+    chapter_index = Column(Integer, nullable=True)
+    chapter_title = Column(String(300), nullable=True)
+    start_page = Column(Integer, nullable=True)
+    end_page = Column(Integer, nullable=True)
 
     # 文件存储
     storage_key = Column(String(500), nullable=False)

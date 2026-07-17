@@ -173,6 +173,15 @@ def run_phase_a_b(job_id: str, pdf_bytes: bytes):
                 job_obj.pending_terms = _json.dumps(new_terms_raw, ensure_ascii=False)
                 db.commit()
             logger.warning("[pipeline] 阶段B.5：发现 %d 个新术语，等待用户审查", len(new_terms_raw))
+            try:
+                from app.services.long_document import refresh_parent_job
+                with SessionLocal() as db:
+                    _job = db.query(TranslationJob).filter(TranslationJob.id == job_id).first()
+                    _parent = _job.parent_job_id if _job else None
+                if _parent:
+                    refresh_parent_job(_parent)
+            except Exception:
+                pass
             return  # ← 暂停，由用户确认后触发 run_phase_d_to_g
         else:
             logger.warning("[pipeline] 阶段B.5完成：无新术语，直接继续翻译")
@@ -409,6 +418,15 @@ def run_phase_d_to_g(job_id: str):
             db.commit()
 
         _push(job_id, JobStatus.COMPLETED, 100, "翻译完成！")
+        try:
+            from app.services.long_document import refresh_parent_job
+            with SessionLocal() as db:
+                _job = db.query(TranslationJob).filter(TranslationJob.id == job_id).first()
+                _parent = _job.parent_job_id if _job else None
+            if _parent:
+                refresh_parent_job(_parent)
+        except Exception:
+            pass
 
     except Exception as e:
         logger.error("[pipeline] phase C-F 失败: %s", e, exc_info=True)
@@ -560,6 +578,15 @@ def run_chinese_pipeline(job_id: str, pdf_bytes: bytes):
             db.commit()
 
         _push(job_id, JobStatus.COMPLETED, 100, "存档完成！")
+        try:
+            from app.services.long_document import refresh_parent_job
+            with SessionLocal() as db:
+                _job = db.query(TranslationJob).filter(TranslationJob.id == job_id).first()
+                _parent = _job.parent_job_id if _job else None
+            if _parent:
+                refresh_parent_job(_parent)
+        except Exception:
+            pass
 
     except Exception as e:
         logger.error("[chinese_pipeline] 失败: %s", e, exc_info=True)

@@ -6,6 +6,9 @@ from datetime import datetime
 class JobResponse(BaseModel):
     id: str
     paper_id: str
+    parent_job_id: Optional[str] = None
+    chapter_index: Optional[int] = None
+    total_chapters: Optional[int] = None
     job_type: Optional[str] = "translation"
     status: str
     current_stage: Optional[str]

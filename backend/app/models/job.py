@@ -6,6 +6,7 @@ from app.database import Base
 
 class JobStatus:
     PENDING = "pending"
+    WAITING_CHAPTERS = "waiting_chapters"
     PARSING = "parsing"
     POLISHING = "polishing"
     WAITING_TERM_REVIEW = "waiting_term_review"
@@ -17,6 +18,8 @@ class JobStatus:
 class JobType:
     TRANSLATION = "translation"   # 外文论文翻译
     ARCHIVE     = "archive"       # 中文论文存档
+    LONG_TRANSLATION = "long_translation"
+    LONG_ARCHIVE = "long_archive"
 
 
 class TranslationJob(Base):
@@ -24,6 +27,9 @@ class TranslationJob(Base):
 
     id = Column(String(36), primary_key=True, default=lambda: str(uuid.uuid4()))
     paper_id = Column(String(36), nullable=False, index=True)
+    parent_job_id = Column(String(36), nullable=True, index=True)
+    chapter_index = Column(Integer, nullable=True)
+    total_chapters = Column(Integer, nullable=True)
     job_type = Column(String(20), default=JobType.TRANSLATION)
     status = Column(String(50), default=JobStatus.PENDING)
     current_stage = Column(String(100))

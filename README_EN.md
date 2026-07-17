@@ -195,6 +195,13 @@ All data is stored entirely on your machine: `backend/data/zpaper.db` (database)
 
 ## Changelog
 
+### v2.0.0
+- **Long document mode**: English upload, Chinese upload, and batch upload can mark a PDF as a long document. Long documents are saved as parent drafts first and do not immediately enter parsing or translation.
+- **Manual chapter splitting**: The new chapter page lets users define page ranges, preview page thumbnails, and validate out-of-range pages, reversed ranges, and overlapping chapters. Uncovered cover or table-of-contents pages are skipped intentionally.
+- **Chapter queue processing**: After confirmation, PyMuPDF splits the original PDF into chapter PDFs, and each chapter enters the existing English translation or Chinese archive queue.
+- **Merged parent result**: Once every chapter finishes, the parent document gets a merged reading result with chapter headings, body content, document memory, and deduplicated references. Library views hide internal chapter papers by default.
+- **Privacy and storage**: Uploaded files, chapter PDFs, and the local database remain under `backend/uploads/` and `backend/data/`, both of which stay ignored by Git.
+
 ### v1.4.0
 - **Long-document translation memory**: builds a compact per-document memory after structure analysis, including the outline, section context, abbreviations, symbols, recurring concepts, and applicable glossary entries. Each paragraph translation now receives only the relevant local context, improving terminology consistency and cross-section continuity without changing PDF parsing.
 

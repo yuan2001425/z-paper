@@ -33,6 +33,13 @@
           </div>
           <div style="display:flex;flex-direction:column;gap:12px;margin-top:16px">
             <div style="display:flex;align-items:center;gap:12px;flex-wrap:wrap">
+              <span style="color:#606266;width:70px;text-align:right;white-space:nowrap">长文档：</span>
+              <el-switch v-model="meta.is_long_document" />
+              <span style="color:#909399;font-size:0.85rem">
+                {{ meta.is_long_document ? '只填写标题、年份和作者' : '按短论文流程处理' }}
+              </span>
+            </div>
+            <div v-if="!meta.is_long_document" style="display:flex;align-items:center;gap:12px;flex-wrap:wrap">
               <span style="color:#606266;width:70px;text-align:right;white-space:nowrap">论文类型：</span>
               <el-radio-group v-model="meta.paper_type">
                 <el-radio value="journal">期刊论文</el-radio>
@@ -46,7 +53,7 @@
               </el-select>
             </div>
             <div style="display:flex;justify-content:flex-end;margin-top:4px">
-              <el-button type="primary" @click="goToStep2" :loading="extracting" :disabled="!meta.domain">
+              <el-button type="primary" @click="goToStep2" :loading="extracting" :disabled="!meta.is_long_document && !meta.domain">
                 {{ extracting ? '正在识别论文信息...' : '下一步' }}
               </el-button>
             </div>
@@ -70,7 +77,11 @@
             <el-input v-model="meta.title" placeholder="论文的中文标题" />
           </el-form-item>
 
-          <el-form-item label="论文类型" required>
+          <el-form-item v-if="meta.is_long_document" label="作者" required>
+            <el-input v-model="meta.authors" placeholder="多个作者用逗号或顿号分隔" />
+          </el-form-item>
+
+          <el-form-item v-if="!meta.is_long_document" label="论文类型" required>
             <el-radio-group v-model="meta.paper_type" @change="onTypeChange">
               <el-radio value="journal">期刊论文</el-radio>
               <el-radio value="conference">会议论文</el-radio>
@@ -78,7 +89,7 @@
           </el-form-item>
 
           <!-- 期刊专属字段 -->
-          <template v-if="meta.paper_type === 'journal'">
+          <template v-if="!meta.is_long_document && meta.paper_type === 'journal'">
             <el-form-item label="期刊名称" required>
               <el-input v-model="meta.journal" placeholder="如：中国科学 / 计算机学报" />
             </el-form-item>
@@ -121,7 +132,7 @@
           </template>
 
           <!-- 会议专属字段 -->
-          <template v-if="meta.paper_type === 'conference'">
+          <template v-if="!meta.is_long_document && meta.paper_type === 'conference'">
             <el-form-item label="会议名称" required>
               <el-input v-model="meta.journal" placeholder="如：CNKI 2024" />
             </el-form-item>
@@ -152,10 +163,9 @@
             </el-form-item>
           </template>
 
-          <el-form-item label="DOI（选填）">
+          <el-form-item v-if="!meta.is_long_document" label="DOI（选填）">
             <el-input v-model="meta.doi" placeholder="如：10.1000/xxx" style="width:360px" />
           </el-form-item>
-
         </el-form>
 
         <div style="display:flex;gap:12px;margin-top:16px">
@@ -194,7 +204,9 @@ const meta = ref({
   divisionTags: [],
   year: new Date().getFullYear(),
   doi: '',
+  authors: '',
   domain: defaultDomain.value,
+  is_long_document: false,
 })
 
 const NO_DIVISION = '无分区/未分类'
@@ -225,8 +237,10 @@ watch(() => meta.value.domain, (val) => { defaultDomain.value = val })
 
 const isFormValid = computed(() => {
   const m = meta.value
-  if (!m.title.trim() || !m.journal.trim()) return false
+  if (!m.title.trim()) return false
   if (!m.year) return false
+  if (m.is_long_document) return !!m.authors.trim()
+  if (!m.journal.trim()) return false
   if (m.divisionTags.length === 0) return false
   if (!m.domain) return false
   return true
@@ -242,7 +256,8 @@ async function goToStep2() {
     const formData = new FormData()
     formData.append('file', file.value)
     if (meta.value.domain) formData.append('domain', meta.value.domain)
-    formData.append('paper_type', meta.value.paper_type)
+    if (meta.value.is_long_document) formData.append('source_language', 'zh')
+    formData.append('paper_type', meta.value.is_long_document ? 'long_document' : meta.value.paper_type)
     const res = await api.post('/papers/extract-metadata', formData, {
       headers: { 'Content-Type': 'multipart/form-data' },
     })
@@ -252,6 +267,7 @@ async function goToStep2() {
       meta.value.title = data.title_zh || data.title || meta.value.title
       meta.value.journal = data.journal || meta.value.journal
       meta.value.year = parseInt(data.year) || meta.value.year
+      if (Array.isArray(data.authors) && data.authors.length > 0) meta.value.authors = data.authors.join('、')
       meta.value.doi = data.doi || meta.value.doi
       if (data.division_tags?.length) meta.value.divisionTags = data.division_tags
       extractedAuto.value = true
@@ -272,15 +288,21 @@ async function submit() {
     formData.append('file', file.value)
     formData.append('title', meta.value.title.trim())
     formData.append('paper_type', meta.value.paper_type)
-    formData.append('journal', meta.value.journal)
+    formData.append('journal', meta.value.is_long_document ? '' : meta.value.journal)
     formData.append('year', meta.value.year)
-    formData.append('doi', meta.value.doi)
+    if (!meta.value.is_long_document) formData.append('doi', meta.value.doi)
     formData.append('division', meta.value.divisionTags.join('、'))
     if (meta.value.domain) formData.append('domain', meta.value.domain)
 
-    const res = await api.post('/papers/upload-chinese', formData, {
+    const endpoint = meta.value.is_long_document ? '/papers/long-drafts' : '/papers/upload-chinese'
+    const res = await api.post(endpoint, formData, {
       headers: { 'Content-Type': 'multipart/form-data' },
     })
+    if (meta.value.is_long_document) {
+      ElMessage.success('长文档已保存，请先完成分章')
+      router.push(`/long-documents/${res.data.paper_id}`)
+      return
+    }
     ElMessage.success('已提交，正在处理...')
     router.push('/jobs')
   } catch (err) {

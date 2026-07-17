@@ -33,6 +33,13 @@
           </div>
           <div style="display:flex;flex-direction:column;gap:12px;margin-top:16px">
             <div style="display:flex;align-items:center;gap:12px;flex-wrap:wrap">
+              <span style="color:#606266;width:70px;text-align:right;white-space:nowrap">长文档：</span>
+              <el-switch v-model="meta.is_long_document" />
+              <span style="color:#909399;font-size:0.85rem">
+                {{ meta.is_long_document ? '只填写标题、年份和作者' : '按短论文流程处理' }}
+              </span>
+            </div>
+            <div v-if="!meta.is_long_document" style="display:flex;align-items:center;gap:12px;flex-wrap:wrap">
               <span style="color:#606266;width:70px;text-align:right;white-space:nowrap">论文类型：</span>
               <el-radio-group v-model="meta.paper_type">
                 <el-radio value="journal">期刊论文</el-radio>
@@ -60,7 +67,7 @@
                 type="primary"
                 @click="goToStep2"
                 :loading="extracting"
-                :disabled="!meta.domain"
+                :disabled="!meta.is_long_document && !meta.domain"
               >
                 {{ extracting ? '正在识别论文信息...' : '下一步' }}
               </el-button>
@@ -144,7 +151,11 @@
             <el-input v-model="meta.title_zh" placeholder="论文的中文标题" />
           </el-form-item>
 
-          <el-form-item label="论文类型" required>
+          <el-form-item v-if="meta.is_long_document" label="作者" required>
+            <el-input v-model="meta.authors" placeholder="多个作者用逗号或顿号分隔" />
+          </el-form-item>
+
+          <el-form-item v-if="!meta.is_long_document" label="论文类型" required>
             <el-radio-group v-model="meta.paper_type" @change="onTypeChange">
               <el-radio value="journal">期刊论文</el-radio>
               <el-radio value="conference">会议论文</el-radio>
@@ -152,7 +163,7 @@
           </el-form-item>
 
           <!-- 期刊专属字段 -->
-          <template v-if="meta.paper_type === 'journal'">
+          <template v-if="!meta.is_long_document && meta.paper_type === 'journal'">
             <el-form-item label="期刊名称" required>
               <el-input v-model="meta.journal" placeholder="如：Nature / IEEE TPAMI / 计算机学报" />
             </el-form-item>
@@ -200,7 +211,7 @@
           </template>
 
           <!-- 会议专属字段 -->
-          <template v-if="meta.paper_type === 'conference'">
+          <template v-if="!meta.is_long_document && meta.paper_type === 'conference'">
             <el-form-item label="会议名称" required>
               <el-input v-model="meta.journal" placeholder="如：NeurIPS 2024 / CVPR 2023" />
             </el-form-item>
@@ -245,7 +256,7 @@
             </el-form-item>
           </template>
 
-          <el-form-item label="DOI（选填）">
+          <el-form-item v-if="!meta.is_long_document" label="DOI（选填）">
             <el-input v-model="meta.doi" placeholder="如：10.1145/3386569.3392506" style="width:360px" />
           </el-form-item>
 
@@ -295,9 +306,11 @@ const meta = ref({
   divisionTags: [],
   year: new Date().getFullYear(),
   doi: '',
+  authors: '',
   source_language: 'en',
   domain: defaultDomain.value,
   translate_images: true,
+  is_long_document: false,
 })
 
 // 用户改了领域 → 同步回全局默认值
@@ -340,8 +353,10 @@ function onTypeChange() {
 
 const isFormValid = computed(() => {
   const m = meta.value
-  if (!m.title.trim() || !m.title_zh.trim() || !m.journal.trim()) return false
+  if (!m.title.trim() || !m.title_zh.trim()) return false
   if (!m.year) return false
+  if (m.is_long_document) return !!m.authors.trim()
+  if (!m.journal.trim()) return false
   if (m.divisionTags.length === 0) return false
   if (!m.domain) return false
   return true
@@ -357,7 +372,7 @@ async function goToStep2() {
     const formData = new FormData()
     formData.append('file', file.value)
     if (meta.value.domain) formData.append('domain', meta.value.domain)
-    formData.append('paper_type', meta.value.paper_type)
+    formData.append('paper_type', meta.value.is_long_document ? 'long_document' : meta.value.paper_type)
     const res = await api.post('/papers/extract-metadata', formData, {
       headers: { 'Content-Type': 'multipart/form-data' },
       timeout: 120000,
@@ -367,6 +382,7 @@ async function goToStep2() {
     if (d.title_zh) meta.value.title_zh = d.title_zh
     if (d.journal) meta.value.journal = d.journal
     if (d.year) meta.value.year = parseInt(d.year) || meta.value.year
+    if (Array.isArray(d.authors) && d.authors.length > 0) meta.value.authors = d.authors.join('、')
     if (d.doi) meta.value.doi = d.doi
     if (d.source_language) meta.value.source_language = d.source_language
     if (Array.isArray(d.division_tags) && d.division_tags.length > 0) {
@@ -404,18 +420,25 @@ async function submit() {
     formData.append('title', meta.value.title)
     if (meta.value.title_zh) formData.append('title_zh', meta.value.title_zh)
     formData.append('paper_type', meta.value.paper_type)
-    formData.append('journal', meta.value.journal)
+    formData.append('journal', meta.value.is_long_document ? '' : meta.value.journal)
     formData.append('year', meta.value.year)
 
-    formData.append('division', meta.value.divisionTags.join('、'))
+    formData.append('division', meta.value.is_long_document ? '' : meta.value.divisionTags.join('、'))
     formData.append('source_language', meta.value.source_language)
+    if (meta.value.is_long_document) formData.append('authors', meta.value.authors)
     if (meta.value.domain) formData.append('domain', meta.value.domain)
-    if (meta.value.doi) formData.append('doi', meta.value.doi)
+    if (!meta.value.is_long_document && meta.value.doi) formData.append('doi', meta.value.doi)
     formData.append('translate_images', meta.value.translate_images ? 'true' : 'false')
 
-    await api.post('/papers/upload', formData, {
+    const endpoint = meta.value.is_long_document ? '/papers/long-drafts' : '/papers/upload'
+    const res = await api.post(endpoint, formData, {
       headers: { 'Content-Type': 'multipart/form-data' }
     })
+    if (meta.value.is_long_document) {
+      ElMessage.success('长文档已保存，请先完成分章')
+      router.push(`/long-documents/${res.data.paper_id}`)
+      return
+    }
     ElMessage.success('上传成功，翻译任务已创建！')
     router.push('/jobs')
   } catch (err) {

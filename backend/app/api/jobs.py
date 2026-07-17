@@ -22,7 +22,12 @@ router = APIRouter()
 
 @router.get("", response_model=list[JobResponse])
 def list_jobs(db: Session = Depends(get_db)):
-    return db.query(TranslationJob).order_by(TranslationJob.created_at.desc()).all()
+    return (
+        db.query(TranslationJob)
+        .filter(TranslationJob.parent_job_id.is_(None))
+        .order_by(TranslationJob.created_at.desc())
+        .all()
+    )
 
 
 @router.get("/{job_id}", response_model=JobResponse)
@@ -49,17 +54,27 @@ def delete_job(job_id: str, db: Session = Depends(get_db)):
     job = db.query(TranslationJob).filter(TranslationJob.id == job_id).first()
     if not job:
         raise HTTPException(status_code=404, detail="任务不存在")
-    paper_id = job.paper_id
-    db.query(TranslationResult).filter(TranslationResult.job_id == job_id).delete(synchronize_session=False)
-    db.delete(job)
-    storage_key = None
-    if paper_id:
-        paper = db.query(Paper).filter(Paper.id == paper_id).first()
-        if paper:
-            storage_key = paper.storage_key
-            db.delete(paper)
+
+    jobs_to_delete = [job]
+    if job.parent_job_id is None:
+        jobs_to_delete.extend(db.query(TranslationJob).filter(TranslationJob.parent_job_id == job.id).all())
+    job_ids = [j.id for j in jobs_to_delete]
+    paper_ids = [j.paper_id for j in jobs_to_delete if j.paper_id]
+    papers = db.query(Paper).filter(Paper.id.in_(paper_ids)).all() if paper_ids else []
+    for parent in [p for p in papers if p.document_role == "long_parent"]:
+        for chapter in db.query(Paper).filter(Paper.parent_paper_id == parent.id).all():
+            if chapter.id not in paper_ids:
+                paper_ids.append(chapter.id)
+                papers.append(chapter)
+    storage_keys = [p.storage_key for p in papers if p.storage_key]
+
+    db.query(TranslationResult).filter(TranslationResult.paper_id.in_(paper_ids)).delete(synchronize_session=False)
+    db.query(TranslationJob).filter(TranslationJob.id.in_(job_ids)).delete(synchronize_session=False)
+    for paper in papers:
+        db.delete(paper)
     db.commit()
-    _delete_upload_file(storage_key)
+    for key in storage_keys:
+        _delete_upload_file(key)
     return {"ok": True}
 
 
@@ -69,10 +84,19 @@ def clear_jobs(status: Optional[str] = Query(None), db: Session = Depends(get_db
     allowed = {JobStatus.COMPLETED, JobStatus.FAILED}
     target = ({status} & allowed) if status else allowed
     if target:
-        jobs = db.query(TranslationJob).filter(TranslationJob.status.in_(target)).all()
+        jobs = db.query(TranslationJob).filter(
+            TranslationJob.status.in_(target),
+            TranslationJob.parent_job_id.is_(None),
+        ).all()
         paper_ids = [j.paper_id for j in jobs if j.paper_id]
         job_ids = [j.id for j in jobs]
-        db.query(TranslationResult).filter(TranslationResult.job_id.in_(job_ids)).delete(synchronize_session=False)
+        for parent_job in list(jobs):
+            child_jobs = db.query(TranslationJob).filter(TranslationJob.parent_job_id == parent_job.id).all()
+            for child in child_jobs:
+                job_ids.append(child.id)
+                if child.paper_id:
+                    paper_ids.append(child.paper_id)
+        db.query(TranslationResult).filter(TranslationResult.paper_id.in_(paper_ids)).delete(synchronize_session=False)
         db.query(TranslationJob).filter(TranslationJob.id.in_(job_ids)).delete(synchronize_session=False)
         storage_keys = []
         if paper_ids:
@@ -179,8 +203,15 @@ async def confirm_terms(
     job.current_stage = f"术语确认完成（{saved} 条加入词库），准备翻译..."
     db.commit()
 
-    # 异步继续翻译流水线
-    from app.services.pipeline import run_phase_d_to_g
-    asyncio.create_task(asyncio.to_thread(run_phase_d_to_g, job_id))
+    parent_job_id = job.parent_job_id
+
+    async def _continue_translation():
+        from app.services.pipeline import run_phase_d_to_g
+        await asyncio.to_thread(run_phase_d_to_g, job_id)
+        if parent_job_id:
+            from app.services.long_document import refresh_parent_job
+            await asyncio.to_thread(refresh_parent_job, parent_job_id)
+
+    asyncio.create_task(_continue_translation())
 
     return {"ok": True, "saved": saved}

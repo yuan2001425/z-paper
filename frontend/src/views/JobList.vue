@@ -26,6 +26,7 @@
         <div class="job-header">
           <span class="job-id">任务 {{ job.id.slice(0, 8) }}</span>
           <el-tag size="small" type="info" v-if="job.job_type === 'archive'" style="margin-right:4px">中文</el-tag>
+          <el-tag size="small" type="warning" v-if="isLongJob(job)" style="margin-right:4px">长文档</el-tag>
           <el-tag :type="statusTagType(job.status)">{{ statusLabel(job.status, job.job_type) }}</el-tag>
         </div>
 
@@ -40,7 +41,7 @@
         </template>
 
         <!-- 待术语审查 -->
-        <div v-if="job.status === 'waiting_term_review'" class="term-review-block">
+        <div v-if="job.status === 'waiting_term_review' && !isLongJob(job)" class="term-review-block">
           <div class="term-review-header">
             <span>{{ job.current_stage }}</span>
             <el-button
@@ -108,6 +109,11 @@
         </div>
 
         <!-- 失败 -->
+        <div v-if="isLongJob(job) && job.status !== 'completed'" class="long-doc-info">
+          <span>{{ job.status === 'waiting_chapters' ? '等待手动分章' : '查看章节处理进度' }}</span>
+          <el-button size="small" type="primary" @click="openLongDocument(job)">进入长文档</el-button>
+        </div>
+
         <el-alert
           v-if="job.status === 'failed'"
           type="error"
@@ -235,6 +241,20 @@ async function clearFailed() {
 }
 
 function statusLabel(status, jobType) {
+  if (jobType === 'long_translation' || jobType === 'long_archive') {
+    const map = {
+      waiting_chapters: '待分章',
+      pending: '章节排队中',
+      parsing: '章节处理中',
+      polishing: '章节整理中',
+      waiting_term_review: '章节待术语审查',
+      translating: '章节处理中',
+      image_translating: '章节图表处理中',
+      completed: '已合并',
+      failed: '失败',
+    }
+    return map[status] || status
+  }
   if (jobType === 'archive') {
     const map = {
       pending: '等待中', parsing: 'PDF 解析中',
@@ -259,7 +279,7 @@ function statusLabel(status, jobType) {
 function statusTagType(status) {
   if (status === 'completed') return 'success'
   if (status === 'failed') return 'danger'
-  if (status === 'waiting_term_review') return 'warning'
+  if (status === 'waiting_term_review' || status === 'waiting_chapters') return 'warning'
   return 'primary'
 }
 
@@ -269,6 +289,14 @@ function isActive(status) {
 
 async function viewResult(jobId) {
   router.push(`/results/by-job/${jobId}`)
+}
+
+function isLongJob(job) {
+  return job?.job_type === 'long_translation' || job?.job_type === 'long_archive'
+}
+
+function openLongDocument(job) {
+  router.push(`/long-documents/${job.paper_id}`)
 }
 
 function formatTime(t) {
@@ -284,6 +312,7 @@ function formatTime(t) {
 .job-id { font-family: monospace; color: #909399; }
 .stage-text { color: #606266; font-size: 0.85rem; }
 .completed-info { display: flex; align-items: center; gap: 16px; margin-top: 8px; }
+.long-doc-info { display: flex; align-items: center; justify-content: space-between; gap: 12px; margin-top: 10px; padding: 10px 12px; border: 1px solid #faecd8; background: #fdf6ec; border-radius: 6px; color: #a16207; font-size: 0.9rem; }
 .job-time { color: #c0c4cc; font-size: 0.8rem; margin-top: 8px; }
 
 /* 术语审查块 */

@@ -56,6 +56,7 @@ def _build_prompt(user_domain: str | None, paper_type: str = "journal") -> str:
         "{\n"
         '  "title": "original-language title of the paper (do not translate)",\n'
         '  "title_zh": "Chinese title if one appears on this page, otherwise empty string",\n'
+        '  "authors": ["author names on this page, in reading order; empty array if not found"],\n'
         f'  "{venue_field}": "name of the {venue_field} (original language; empty string if not found)",\n'
         '  "year": "4-digit publication year as a string (empty string if not found)",\n'
         '  "source_language": "ISO 639-1 code of the paper\'s language; '
@@ -92,6 +93,7 @@ class MetadataExtractor:
 
         empty = {
             "title": "", "title_zh": "", "journal": "",
+            "authors": [],
             "year": "", "source_language": "en",
             "division_tags": [],
             "doi": "", "corresponding_author_email": "",
@@ -190,6 +192,12 @@ class MetadataExtractor:
         str_fields = ["title", "title_zh", "journal", "year", "source_language",
                       "doi", "corresponding_author_email"]
         result = {k: str(data.get(k, "") or "") for k in str_fields}
+        raw_authors = data.get("authors", [])
+        if isinstance(raw_authors, str):
+            raw_authors = [a.strip() for a in re.split(r"[,;，；、]", raw_authors) if a.strip()]
+        elif not isinstance(raw_authors, list):
+            raw_authors = []
+        result["authors"] = [str(a).strip() for a in raw_authors if str(a).strip()]
         result["paper_type"] = paper_type
 
         # 校验 source_language

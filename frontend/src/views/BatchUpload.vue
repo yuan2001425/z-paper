@@ -141,14 +141,25 @@
               <el-input v-model="meta.title_zh" placeholder="论文的中文标题" />
             </el-form-item>
 
-            <el-form-item label="论文类型" required>
+            <el-form-item label="长文档">
+              <el-switch v-model="meta.is_long_document" />
+              <span style="margin-left:10px;font-size:0.85rem;color:#909399">
+                {{ meta.is_long_document ? '只填写标题、年份和作者' : '按短论文流程处理' }}
+              </span>
+            </el-form-item>
+
+            <el-form-item v-if="meta.is_long_document" label="作者" required>
+              <el-input v-model="meta.authors" placeholder="多个作者用逗号或顿号分隔" />
+            </el-form-item>
+
+            <el-form-item v-if="!meta.is_long_document" label="论文类型" required>
               <el-radio-group v-model="meta.paper_type" @change="onTypeChange">
                 <el-radio value="journal">期刊论文</el-radio>
                 <el-radio value="conference">会议论文</el-radio>
               </el-radio-group>
             </el-form-item>
 
-            <template v-if="meta.paper_type === 'journal'">
+            <template v-if="!meta.is_long_document && meta.paper_type === 'journal'">
               <el-form-item label="期刊名称" required>
                 <el-input v-model="meta.journal" placeholder="如：Nature / IEEE TPAMI" />
               </el-form-item>
@@ -173,7 +184,7 @@
               </el-form-item>
             </template>
 
-            <template v-if="meta.paper_type === 'conference'">
+            <template v-if="!meta.is_long_document && meta.paper_type === 'conference'">
               <el-form-item label="会议名称" required>
                 <el-input v-model="meta.journal" placeholder="如：NeurIPS 2024 / CVPR 2023" />
               </el-form-item>
@@ -204,7 +215,7 @@
               </el-select>
             </el-form-item>
 
-            <el-form-item label="DOI（选填）">
+            <el-form-item v-if="!meta.is_long_document" label="DOI（选填）">
               <el-input v-model="meta.doi" placeholder="如：10.1145/3386569.3392506" style="width:360px" />
             </el-form-item>
 
@@ -272,6 +283,7 @@
               <el-tag size="small" :type="row.meta.source_language === 'zh' ? 'success' : ''">
                 {{ row.meta.source_language === 'zh' ? '中文' : '英文' }}
               </el-tag>
+              <el-tag v-if="row.meta.is_long_document" size="small" type="warning" style="margin-left:4px">长</el-tag>
             </template>
           </el-table-column>
           <el-table-column label="期刊/会议" prop="meta.journal" min-width="140" />
@@ -374,15 +386,18 @@ function freshMeta(language = 'en') {
   return {
     title: '', title_zh: '', paper_type: batchDefaultType.value, journal: '',
     divisionTags: [], year: new Date().getFullYear(),
-    doi: '', source_language: language, domain: defaultDomain.value,
+    doi: '', authors: '', source_language: language, domain: defaultDomain.value,
     translate_images: true,
+    is_long_document: false,
   }
 }
 const meta = ref(freshMeta())
 
 const isFormValid = computed(() => {
   const m = meta.value
-  return !!(m.title.trim() && m.title_zh.trim() && m.journal.trim() && m.year && m.divisionTags.length && m.domain)
+  if (!m.title.trim() || !m.title_zh.trim() || !m.year) return false
+  if (m.is_long_document) return !!m.authors.trim()
+  return !!(m.journal.trim() && m.divisionTags.length && m.domain)
 })
 
 function onTypeChange() { meta.value.divisionTags = [] }
@@ -419,6 +434,7 @@ async function extractForCurrent() {
     if (d.title_zh) meta.value.title_zh = d.title_zh
     if (d.journal)  meta.value.journal  = d.journal
     if (d.year)     meta.value.year     = parseInt(d.year) || meta.value.year
+    if (Array.isArray(d.authors) && d.authors.length > 0) meta.value.authors = d.authors.join('、')
     if (d.doi)      meta.value.doi      = d.doi
     if (d.source_language) meta.value.source_language = d.source_language
     if (Array.isArray(d.division_tags) && d.division_tags.length > 0) {
@@ -490,6 +506,7 @@ async function submitAll() {
   submitting.value = true
   submitProgress.value = { done: 0, total: confirmedList.value.length }
   let failCount = 0
+  const longPaperIds = []
 
   for (const item of confirmedList.value) {
     try {
@@ -498,18 +515,25 @@ async function submitAll() {
       fd.append('title', item.meta.title)
       if (item.meta.title_zh) fd.append('title_zh', item.meta.title_zh)
       fd.append('paper_type', item.meta.paper_type)
-      fd.append('journal', item.meta.journal)
+      fd.append('journal', item.meta.is_long_document ? '' : item.meta.journal)
       fd.append('year', item.meta.year)
       fd.append('division', item.meta.divisionTags.join('、'))
       fd.append('source_language', item.meta.source_language)
+      if (item.meta.is_long_document) fd.set('division', '')
       if (item.meta.domain)  fd.append('domain', item.meta.domain)
-      if (item.meta.doi)     fd.append('doi', item.meta.doi)
+      if (item.meta.is_long_document) fd.append('authors', item.meta.authors)
+      if (!item.meta.is_long_document && item.meta.doi) fd.append('doi', item.meta.doi)
 
-      const endpoint = item.meta.source_language === 'zh' ? '/papers/upload-chinese' : '/papers/upload'
+      const endpoint = item.meta.is_long_document
+        ? '/papers/long-drafts'
+        : (item.meta.source_language === 'zh' ? '/papers/upload-chinese' : '/papers/upload')
       if (item.meta.source_language !== 'zh') {
         fd.append('translate_images', item.meta.translate_images ? 'true' : 'false')
       }
-      await api.post(endpoint, fd, { headers: { 'Content-Type': 'multipart/form-data' } })
+      const res = await api.post(endpoint, fd, { headers: { 'Content-Type': 'multipart/form-data' } })
+      if (item.meta.is_long_document && res.data?.paper_id) {
+        longPaperIds.push(res.data.paper_id)
+      }
     } catch {
       failCount++
     }
@@ -522,7 +546,11 @@ async function submitAll() {
   } else {
     ElMessage.warning(`${confirmedList.value.length - failCount} 篇成功，${failCount} 篇失败`)
   }
-  router.push('/jobs')
+  if (longPaperIds.length === 1) {
+    router.push(`/long-documents/${longPaperIds[0]}`)
+  } else {
+    router.push('/jobs')
+  }
 }
 </script>
 
