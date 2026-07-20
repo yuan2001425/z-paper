@@ -124,7 +124,16 @@
 
         <div style="display:flex;justify-content:space-between;align-items:center;margin-top:8px">
           <span class="job-time">提交时间：{{ formatTime(job.created_at) }}</span>
-          <el-button type="danger" size="small" text @click="deleteJob(job.id)">删除</el-button>
+          <div style="display:flex;gap:8px;align-items:center">
+            <el-button
+              v-if="job.status === 'failed'"
+              type="warning"
+              size="small"
+              :loading="restarting[job.id]"
+              @click="restartJob(job)"
+            >重新开始</el-button>
+            <el-button type="danger" size="small" text @click="deleteJob(job.id)">删除</el-button>
+          </div>
         </div>
       </el-card>
     </main>
@@ -146,6 +155,7 @@ const jobStore = useJobStore()
 const { jobs } = storeToRefs(jobStore)
 const clearingCompleted = ref(false)
 const clearingFailed = ref(false)
+const restarting = reactive({})
 
 // termState[jobId] = { loading, confirming, terms: [{en, zh, include}] | null }
 const termState = reactive({})
@@ -189,6 +199,20 @@ async function confirmTerms(jobId) {
     ElMessage.error('确认失败：' + (err.response?.data?.detail || err.message))
   } finally {
     state.confirming = false
+  }
+}
+
+async function restartJob(job) {
+  restarting[job.id] = true
+  try {
+    const res = await api.post(`/jobs/${job.id}/restart`)
+    const count = res.data?.restarted || 1
+    ElMessage.success(count > 1 ? `已重新开始 ${count} 个失败章节` : '已重新开始任务')
+    await jobStore.fetchJobs()
+  } catch (err) {
+    ElMessage.error('重新开始失败：' + (err.response?.data?.detail || err.message))
+  } finally {
+    restarting[job.id] = false
   }
 }
 

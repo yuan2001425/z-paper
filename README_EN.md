@@ -195,6 +195,11 @@ All data is stored entirely on your machine: `backend/data/zpaper.db` (database)
 
 ## Changelog
 
+### v2.1.0
+- **Restart failed jobs**: Failed short-document jobs now show a "Restart" button in the job list, reusing the original PDF to rerun parsing plus translation or Chinese archiving.
+- **Retry long-document chapters**: The long-document detail page can restart a single failed chapter, and a failed parent long document can restart all failed chapters at once before continuing the merged result workflow.
+- **Retry safety**: Restart is available only for failed jobs. Before rerunning, the system clears stale error state and old results for that job without creating duplicate paper records or changing the privacy ignore rules for `backend/uploads/` and `backend/data/`.
+
 ### v2.0.0
 - **Long document mode**: English upload, Chinese upload, and batch upload can mark a PDF as a long document. Long documents are saved as parent drafts first and do not immediately enter parsing or translation.
 - **Manual chapter splitting**: The new chapter page lets users define page ranges, preview page thumbnails, and validate out-of-range pages, reversed ranges, and overlapping chapters. Uncovered cover or table-of-contents pages are skipped intentionally.

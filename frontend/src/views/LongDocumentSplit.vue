@@ -84,6 +84,12 @@
                 <p class="sub-title">{{ parentJob.current_stage || statusLabel(parentJob.status) }}</p>
               </div>
               <div style="display:flex;gap:8px;flex-wrap:wrap">
+                <el-button
+                  v-if="parentJob.status === 'failed'"
+                  type="warning"
+                  :loading="restarting[parentJob.id]"
+                  @click="restartJob(parentJob.id, '失败章节')"
+                >重新开始失败章节</el-button>
                 <el-button v-if="parentJob.status === 'completed'" type="success" @click="$router.push(`/results/by-paper/${paper.id}`)">阅读合并结果</el-button>
                 <el-button @click="loadDetail">刷新</el-button>
               </div>
@@ -111,10 +117,17 @@
                   <div class="tiny-stage">{{ row.current_stage }}</div>
                 </template>
               </el-table-column>
-              <el-table-column label="操作" width="180">
+              <el-table-column label="操作" width="220">
                 <template #default="{ row }">
                   <el-button v-if="row.status === 'completed'" size="small" @click="$router.push(`/results/by-job/${row.job_id}`)">阅读</el-button>
                   <el-button v-if="row.status === 'waiting_term_review'" size="small" type="warning" @click="openTermReview(row)">术语审查</el-button>
+                  <el-button
+                    v-if="row.status === 'failed'"
+                    size="small"
+                    type="warning"
+                    :loading="restarting[row.job_id]"
+                    @click="restartJob(row.job_id, '章节')"
+                  >重新开始</el-button>
                 </template>
               </el-table-column>
             </el-table>
@@ -161,6 +174,7 @@ const route = useRoute()
 const loading = ref(true)
 const submitting = ref(false)
 const outlineLoading = ref(false)
+const restarting = reactive({})
 const paper = ref(null)
 const parentJob = ref(null)
 const chapters = ref([])
@@ -318,6 +332,20 @@ async function confirmTerms() {
     await loadDetail()
   } finally {
     termDialog.confirming = false
+  }
+}
+
+async function restartJob(jobId, label = '任务') {
+  restarting[jobId] = true
+  try {
+    const res = await api.post(`/jobs/${jobId}/restart`)
+    const count = res.data?.restarted || 1
+    ElMessage.success(count > 1 ? `已重新开始 ${count} 个失败章节` : `已重新开始${label}`)
+    await loadDetail()
+  } catch (err) {
+    ElMessage.error('重新开始失败：' + (err.response?.data?.detail || err.message))
+  } finally {
+    restarting[jobId] = false
   }
 }
 

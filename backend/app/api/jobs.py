@@ -9,7 +9,7 @@ from sqlalchemy.orm import Session
 
 from app.config import settings
 from app.database import get_db
-from app.models.job import TranslationJob, JobStatus
+from app.models.job import TranslationJob, JobStatus, JobType
 from app.models.user_glossary import UserGlossary
 from app.models.paper import Paper
 from app.models.result import TranslationResult
@@ -47,6 +47,93 @@ def _delete_upload_file(storage_key: str):
         os.remove(path)
     except FileNotFoundError:
         pass
+
+
+def _reset_job_for_restart(db: Session, job: TranslationJob):
+    if job.status != JobStatus.FAILED:
+        raise HTTPException(status_code=400, detail="只有失败的任务可以重新开始")
+
+    paper = db.query(Paper).filter(Paper.id == job.paper_id).first()
+    if not paper or not paper.storage_key:
+        raise HTTPException(status_code=400, detail="原始 PDF 不存在，无法重新开始")
+
+    db.query(TranslationResult).filter(TranslationResult.job_id == job.id).delete(synchronize_session=False)
+    job.status = JobStatus.PENDING
+    job.progress = 0
+    job.current_stage = "已重新排队"
+    job.error_message = None
+    job.pending_terms = None
+    job.completed_at = None
+    return paper.storage_key
+
+
+def _schedule_restart(job_id: str, storage_key: str, job_type: str):
+    from app.tasks.translation_tasks import start_archiving, start_translation
+
+    if job_type == JobType.ARCHIVE:
+        asyncio.create_task(start_archiving(job_id, storage_key))
+    else:
+        asyncio.create_task(start_translation(job_id, storage_key))
+
+
+@router.post("/{job_id}/restart")
+async def restart_job(job_id: str, db: Session = Depends(get_db)):
+    job = db.query(TranslationJob).filter(TranslationJob.id == job_id).first()
+    if not job:
+        raise HTTPException(status_code=404, detail="任务不存在")
+
+    restarts = []
+    parent_to_monitor = None
+
+    if job.parent_job_id is None and job.job_type in (JobType.LONG_TRANSLATION, JobType.LONG_ARCHIVE):
+        if job.status != JobStatus.FAILED:
+            raise HTTPException(status_code=400, detail="只有失败的长文档任务可以重新开始")
+        failed_children = (
+            db.query(TranslationJob)
+            .filter(
+                TranslationJob.parent_job_id == job.id,
+                TranslationJob.status == JobStatus.FAILED,
+            )
+            .order_by(TranslationJob.chapter_index.asc())
+            .all()
+        )
+        if not failed_children:
+            raise HTTPException(status_code=400, detail="没有失败章节可重新开始")
+
+        db.query(TranslationResult).filter(TranslationResult.job_id == job.id).delete(synchronize_session=False)
+        job.status = JobStatus.PENDING
+        job.progress = 0
+        job.current_stage = f"正在重跑 {len(failed_children)} 个失败章节"
+        job.error_message = None
+        job.completed_at = None
+
+        for child in failed_children:
+            storage_key = _reset_job_for_restart(db, child)
+            restarts.append((child.id, storage_key, child.job_type))
+        parent_to_monitor = job.id
+    else:
+        storage_key = _reset_job_for_restart(db, job)
+        restarts.append((job.id, storage_key, job.job_type))
+        if job.parent_job_id:
+            parent = db.query(TranslationJob).filter(TranslationJob.id == job.parent_job_id).first()
+            if parent:
+                parent.status = JobStatus.PENDING
+                parent.progress = min(parent.progress or 0, 99)
+                parent.current_stage = f"第 {job.chapter_index or ''} 章已重新排队".strip()
+                parent.error_message = None
+                parent.completed_at = None
+            parent_to_monitor = job.parent_job_id
+
+    db.commit()
+
+    for restart_job_id, storage_key, restart_type in restarts:
+        _schedule_restart(restart_job_id, storage_key, restart_type)
+
+    if parent_to_monitor:
+        from app.services.long_document import monitor_parent_job
+        asyncio.create_task(monitor_parent_job(parent_to_monitor))
+
+    return {"ok": True, "restarted": len(restarts)}
 
 
 @router.delete("/{job_id}")
