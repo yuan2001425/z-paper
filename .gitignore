@@ -18,6 +18,7 @@ launcher/
 installer/
 dist/
 python-embed/
+packaging/build/
 icon.svg
 
 # IDE / OS

@@ -127,6 +127,7 @@
         </el-form>
 
       </div>
+      <DataSyncPanel />
     </div>
   </div>
 </template>
@@ -137,6 +138,7 @@ import { useRouter } from 'vue-router'
 import { ElMessage } from 'element-plus'
 import { View, Hide } from '@element-plus/icons-vue'
 import AppHeader from '@/components/AppHeader.vue'
+import DataSyncPanel from '@/components/DataSyncPanel.vue'
 import api from '@/api/index.js'
 import { markConfigured } from '@/router/index.js'
 
@@ -201,6 +203,9 @@ onMounted(loadStatus)
 .settings-body {
   flex: 1;
   display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 24px;
   justify-content: center;
   padding: 40px 16px;
 }
@@ -211,7 +216,7 @@ onMounted(loadStatus)
   box-shadow: 0 2px 12px rgba(0,0,0,0.08);
   padding: 40px 48px;
   width: 100%;
-  max-width: 640px;
+  max-width: 760px;
 }
 
 .settings-header {

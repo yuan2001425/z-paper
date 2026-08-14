@@ -191,9 +191,29 @@ On first launch, you will be redirected to the settings page. Enter three API ke
 
 All data is stored entirely on your machine: `backend/data/zpaper.db` (database) and `backend/uploads/` (files). Back up these two directories to fully migrate your data.
 
+### Same-WLAN Data Sync
+
+When two computers are on the same WLAN and both are running z-paper, open the bottom section of the Settings page to sync data:
+
+1. On the receiver, click "Enable discovery" so it can be found by devices on the same WLAN for a short time.
+2. On the sender, click "Scan devices", select the receiver, and send a sync request.
+3. On the receiver, approve the pending request. The UI shows manifest comparison, packaging, transfer, and import logs.
+
+Both devices must run the same z-paper sync version. The sync includes API settings, the paper library, translation results, annotations, chat history, glossaries, folders, and uploaded files. z-paper compares source and receiver manifests first, then packages only database rows and uploaded files missing from the receiver; uploaded files are compared by relative path, size, and SHA-256 fingerprint, and same-path files with different content are treated as conflicts and skipped without overwriting the receiver. API settings are updated from the source. The receiver's existing database is backed up first under `backend/data/sync_backups/`.
+
+If discovery cannot find the other device, check that the system firewall allows z-paper / Python / uvicorn on the local network and permits TCP `8000` plus UDP `37621`. Sync works in both packaged production mode and source development mode; in development mode another computer may open `http://<this-computer-ip>:3000`, while sync APIs still use backend port `8000`.
+
 ---
 
 ## Changelog
+
+### v2.2.0
+- **Same-WLAN data sync**: The receiver enables discovery, then the sender scans available z-paper devices on the same WLAN and sends a request without manually entering the target address.
+- **Differential sync**: z-paper compares source and receiver manifests first and packages only database rows and uploaded files missing from the receiver; same-path uploaded files with different content are skipped as conflicts to avoid overwriting existing PDFs.
+- **Version checks and interactive progress**: Sync requires matching versions and shows frontend progress, logs, and errors during transfer and import.
+- **Receiver approval and backup**: The receiver must approve the transfer manually. The receiver database is backed up to `backend/data/sync_backups/`, and sync is blocked while parsing or translation jobs are running.
+- **LAN-ready startup**: Windows, Linux/macOS startup scripts and the Vite dev server now listen on LAN addresses by default.
+- **Known bug fixes**: Fixed packaged discovery returning 500 on Chinese Windows network output, stale backend services surviving overwrite installs, and the redundant "Refresh page" button after a successful import.
 
 ### v2.1.0
 - **Restart failed jobs**: Failed short-document jobs now show a "Restart" button in the job list, reusing the original PDF to rerun parsing plus translation or Chinese archiving.

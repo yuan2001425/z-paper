@@ -55,6 +55,7 @@ echo "[3/3] Starting Z-Paper..."
 echo
 echo "========================================"
 echo "   http://localhost:8000"
+echo "   Same-WLAN access: http://<this-computer-ip>:8000"
 echo "   Press Ctrl+C to stop."
 echo "========================================"
 echo
@@ -64,4 +65,4 @@ echo
 
 cd backend
 source venv/bin/activate
-uvicorn app.main:app --port 8000
+uvicorn app.main:app --host 0.0.0.0 --port 8000
