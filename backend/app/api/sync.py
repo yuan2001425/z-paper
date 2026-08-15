@@ -32,7 +32,7 @@ from app.models.job import JobStatus, TranslationJob
 
 router = APIRouter()
 
-SYNC_APP_VERSION = "2.2.0"
+SYNC_APP_VERSION = "2.2.1"
 SYNC_TTL_MINUTES = 15
 DISCOVERY_PORT = 37621
 _pending_requests: dict[str, dict] = {}
@@ -133,6 +133,22 @@ def _safe_upload_target(rel_path: str) -> Path:
     except ValueError as exc:
         raise HTTPException(status_code=400, detail="同步文件路径非法") from exc
     return target
+
+
+def _safe_bundle_member(root: Path, rel_path: str) -> Path:
+    target = (root / rel_path).resolve()
+    try:
+        target.relative_to(root)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail="同步包包含非法路径，已拒绝导入") from exc
+    return target
+
+
+def _bundle_archive_path(index: int, rel_path: str) -> str:
+    suffix = Path(rel_path).suffix.lower()
+    if not re.fullmatch(r"\.[a-z0-9]{1,12}", suffix or ""):
+        suffix = ".bin"
+    return f"files/{index:06d}{suffix}"
 
 
 def _short_paths(paths: list[str], limit: int = 5) -> str:
@@ -512,11 +528,7 @@ def _safe_extract(zip_path: Path, target_dir: Path) -> None:
     root = target_dir.resolve()
     with zipfile.ZipFile(zip_path, "r") as archive:
         for member in archive.infolist():
-            destination = (root / member.filename).resolve()
-            try:
-                destination.relative_to(root)
-            except ValueError:
-                raise HTTPException(status_code=400, detail="同步包包含非法路径，已拒绝导入")
+            _safe_bundle_member(root, member.filename)
         archive.extractall(root)
 
 
@@ -591,6 +603,7 @@ def _create_bundle(request_id: str, selection: ExportSelection) -> tuple[Path, P
     copied_rows = _copy_selected_rows(delta_db_path, selection)
 
     upload_files = []
+    missing_files: list[str] = []
     seen_files: set[str] = set()
     for rel_path in selection.files:
         if rel_path in seen_files:
@@ -601,15 +614,18 @@ def _create_bundle(request_id: str, selection: ExportSelection) -> tuple[Path, P
             stat = source.stat()
             upload_files.append({
                 "path": rel_path,
+                "archive_path": _bundle_archive_path(len(upload_files) + 1, rel_path),
                 "source": source,
                 "size": stat.st_size,
                 "sha256": _file_sha256(source),
             })
+        else:
+            missing_files.append(rel_path)
 
     manifest = {
         "app": "z-paper",
         "kind": "wlan-sync-bundle",
-        "bundle_version": 2,
+        "bundle_version": 3,
         "app_version": SYNC_APP_VERSION,
         "request_id": request_id,
         "generated_at": _now().isoformat() + "Z",
@@ -617,8 +633,15 @@ def _create_bundle(request_id: str, selection: ExportSelection) -> tuple[Path, P
         "row_count": copied_rows,
         "upload_count": len(upload_files),
         "upload_bytes": sum(item["size"] for item in upload_files),
+        "missing_source_count": len(missing_files),
+        "missing_source_files": missing_files[:50],
         "uploads": [
-            {"path": item["path"], "size": item["size"], "sha256": item["sha256"]}
+            {
+                "path": item["path"],
+                "archive_path": item["archive_path"],
+                "size": item["size"],
+                "sha256": item["sha256"],
+            }
             for item in upload_files
         ],
     }
@@ -627,7 +650,7 @@ def _create_bundle(request_id: str, selection: ExportSelection) -> tuple[Path, P
         archive.writestr("manifest.json", json.dumps(manifest, ensure_ascii=False, indent=2))
         archive.write(delta_db_path, "data/zpaper-delta.db")
         for item in upload_files:
-            archive.write(item["source"], f"uploads/{item['path']}")
+            archive.write(item["source"], item["archive_path"])
 
     return zip_path, temp_dir
 
@@ -638,7 +661,6 @@ def _replace_current_data(extract_dir: Path) -> dict:
 
     manifest_path = extract_dir / "manifest.json"
     incoming_db = extract_dir / "data" / "zpaper-delta.db"
-    incoming_uploads = extract_dir / "uploads"
     if not manifest_path.exists() or not incoming_db.exists():
         raise HTTPException(status_code=400, detail="同步包不完整，无法导入")
 
@@ -655,15 +677,12 @@ def _replace_current_data(extract_dir: Path) -> dict:
     db_path = _db_path()
     uploads_path = _uploads_dir()
     backup_db = backup_root / "zpaper.db"
-    upload_manifest = {
-        item.get("path"): item
-        for item in manifest.get("uploads", [])
-        if item.get("path")
-    }
+    upload_manifest = [item for item in manifest.get("uploads", []) if item.get("path")]
 
     engine.dispose()
     copied_files: list[Path] = []
     skipped_existing_files = 0
+    skipped_missing_files = 0
     try:
         if db_path.exists():
             _create_db_snapshot(backup_db)
@@ -699,35 +718,37 @@ def _replace_current_data(extract_dir: Path) -> dict:
             current.close()
 
         uploads_path.mkdir(parents=True, exist_ok=True)
-        if incoming_uploads.exists():
-            for source in incoming_uploads.rglob("*"):
-                if not source.is_file():
+        for meta in upload_manifest:
+            rel_path = meta.get("path") or ""
+            archive_path = meta.get("archive_path") or f"uploads/{rel_path}"
+            source = _safe_bundle_member(extract_dir.resolve(), archive_path)
+            if not source.exists() or not source.is_file():
+                skipped_missing_files += 1
+                logger.warning("sync bundle file missing, skipped: %s", rel_path)
+                continue
+            destination = _safe_upload_target(rel_path)
+            expected_size = meta.get("size")
+            expected_hash = meta.get("sha256")
+            source_hash = _file_sha256(source)
+            if expected_size is not None and source.stat().st_size != expected_size:
+                raise HTTPException(status_code=400, detail=f"同步包文件大小校验失败：{rel_path}")
+            if expected_hash and source_hash != expected_hash:
+                raise HTTPException(status_code=400, detail=f"同步包文件哈希校验失败：{rel_path}")
+            destination.parent.mkdir(parents=True, exist_ok=True)
+            if destination.exists():
+                if (
+                    destination.is_file()
+                    and destination.stat().st_size == source.stat().st_size
+                    and _file_sha256(destination) == source_hash
+                ):
+                    skipped_existing_files += 1
                     continue
-                rel_path = source.relative_to(incoming_uploads).as_posix()
-                destination = _safe_upload_target(rel_path)
-                meta = upload_manifest.get(rel_path) or {}
-                expected_size = meta.get("size")
-                expected_hash = meta.get("sha256")
-                source_hash = _file_sha256(source)
-                if expected_size is not None and source.stat().st_size != expected_size:
-                    raise HTTPException(status_code=400, detail=f"同步包文件大小校验失败：{rel_path}")
-                if expected_hash and source_hash != expected_hash:
-                    raise HTTPException(status_code=400, detail=f"同步包文件哈希校验失败：{rel_path}")
-                destination.parent.mkdir(parents=True, exist_ok=True)
-                if destination.exists():
-                    if (
-                        destination.is_file()
-                        and destination.stat().st_size == source.stat().st_size
-                        and _file_sha256(destination) == source_hash
-                    ):
-                        skipped_existing_files += 1
-                        continue
-                    raise HTTPException(
-                        status_code=409,
-                        detail=f"同步包中的文件与本机已有文件路径冲突，已停止导入且不会覆盖目标端：{rel_path}",
-                    )
-                copied_files.append(destination)
-                shutil.copy2(source, destination)
+                raise HTTPException(
+                    status_code=409,
+                    detail=f"同步包中的文件与本机已有文件路径冲突，已停止导入且不会覆盖目标端：{rel_path}",
+                )
+            copied_files.append(destination)
+            shutil.copy2(source, destination)
 
         engine.dispose()
         Base.metadata.create_all(bind=engine)
@@ -740,6 +761,8 @@ def _replace_current_data(extract_dir: Path) -> dict:
             "upload_count": manifest.get("upload_count", 0),
             "upload_bytes": manifest.get("upload_bytes", 0),
             "skipped_existing_files": skipped_existing_files,
+            "skipped_missing_files": skipped_missing_files,
+            "missing_source_count": manifest.get("missing_source_count", 0),
         }
     except Exception:
         engine.dispose()

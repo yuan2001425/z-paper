@@ -4,7 +4,7 @@ $Root = Resolve-Path (Join-Path $PSScriptRoot "..")
 $BuildRoot = Join-Path $Root "packaging\build"
 $Stage = Join-Path $BuildRoot "app"
 $InstallerDir = Join-Path $Root "installer"
-$AppVersion = "2.2.0"
+$AppVersion = "2.2.1"
 
 function Copy-Tree($Source, $Destination, [string[]]$ExcludeDirs = @(), [string[]]$ExcludeFiles = @()) {
     New-Item -ItemType Directory -Force -Path $Destination | Out-Null

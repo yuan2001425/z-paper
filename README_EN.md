@@ -207,6 +207,11 @@ If discovery cannot find the other device, check that the system firewall allows
 
 ## Changelog
 
+### v2.2.1
+- **Known bug fixes**: Fixed Same-WLAN sync failures caused by very long PDF filenames being extracted under Windows temporary directories. Sync bundles now store files under short internal paths and restore original upload paths through the manifest.
+- **More tolerant sync import**: Export skips upload files that are already missing on the source device. Import records and skips individual missing bundle files instead of failing the whole 800 MB-class sync.
+- **Version check update**: Same-WLAN sync version is now `2.2.1`; both computers need the same version before syncing.
+
 ### v2.2.0
 - **Same-WLAN data sync**: The receiver enables discovery, then the sender scans available z-paper devices on the same WLAN and sends a request without manually entering the target address.
 - **Differential sync**: z-paper compares source and receiver manifests first and packages only database rows and uploaded files missing from the receiver; same-path uploaded files with different content are skipped as conflicts to avoid overwriting existing PDFs.

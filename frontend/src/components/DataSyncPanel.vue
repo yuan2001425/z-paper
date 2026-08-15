@@ -184,6 +184,12 @@ const resultSummary = computed(() => {
   if (result.skipped_existing_files) {
     lines.push(`跳过已存在文件：${result.skipped_existing_files} 个`)
   }
+  if (result.skipped_missing_files) {
+    lines.push(`跳过包内缺失文件：${result.skipped_missing_files} 个`)
+  }
+  if (result.missing_source_count) {
+    lines.push(`来源端缺失文件：${result.missing_source_count} 个（已跳过）`)
+  }
   if (result.backup_path) {
     lines.push(`本机备份：${result.backup_path}`)
   }
