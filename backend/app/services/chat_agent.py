@@ -61,7 +61,7 @@ _STATIC_SYSTEM = """\
 
 # 核心规则
 1. 回答前必须先调用至少一个工具去查证。即使问题看似离题，也要先搜索。
-2. 引用内容时用「论文标题 + block_idx」定位（如「《XX》block 12」或「论文A:12」），让用户能跳到原文。
+2. 引用具体段落时，用 markdown 链接格式 `[block N](paper_id)` 标注：paper_id 用工具结果里的**完整**论文 ID（不要截断），N 是 block_idx。例如 `[block 13](f752a8df-cd89-4e78-a188-ff7c70f05ba4)`。同一篇论文的多个 block 用多个链接分别标。这样用户能点击跳转到原文对应段落。
 3. 除非用户用英文提问，否则用中文回答。
 4. 独立的工具调用要一次性并行发起（见下），不要串行等待。
 
@@ -756,7 +756,7 @@ def run_chat_turn(
     return {
         "answer":             answer,
         "tool_calls":         tool_call_log,
-        "citations":          _enrich_citations(citations),
+        "citations":          _enrich_citations(citations + _extract_answer_citations(answer)),
         "new_history":        new_history,
         "compaction_summary": new_compaction,
         "compact_failures":   compact_failures,
@@ -993,7 +993,7 @@ def run_chat_turn_stream(
         "type":               "done",
         "answer":             answer,
         "tool_calls":         tool_call_log,
-        "citations":          _enrich_citations(citations),
+        "citations":          _enrich_citations(citations + _extract_answer_citations(answer)),
         "new_history":        new_history,
         "compaction_summary": new_compaction,
         "compact_failures":   compact_failures,
@@ -1093,6 +1093,51 @@ def _collect_citations(tool_name: str, args: dict, result_str: str, citations: l
                 })
 
 
+# ── 回答引用解析（[block N](paper_id) → 精确引用） ─────────────────────────────
+_ANSWER_CITE_RE = _re.compile(r'\[block\s*(\d+)\]\(([0-9a-fA-F-]{36})\)')
+
+
+def _fetch_block_text(paper_id: str, block_idx: int) -> str:
+    """从论文结构里取某个 block 的文本（用于生成精确引用卡片）。"""
+    from app.models.result import TranslationResult
+    with SessionLocal() as db:
+        result = db.query(TranslationResult).filter(
+            TranslationResult.paper_id == paper_id
+        ).order_by(TranslationResult.created_at.desc()).first()
+    if not result:
+        return ""
+    blocks = result.structure_json.get("正文", [])
+    if block_idx < 0 or block_idx >= len(blocks):
+        return ""
+    b = blocks[block_idx]
+    return (b.get("中文文本") or b.get("文本", "")).strip()[:200]
+
+
+def _extract_answer_citations(answer: str) -> list[dict]:
+    """解析回答文本里的 `[block N](paper_id)` 引用，生成精确引用。
+
+    这是「引用卡片齐全 + 可跳转」的关键：模型在回答里引用了哪些段落，就精确收集哪些，
+    而不是靠工具结果的前 N 条近似（后者漏掉大量引用，导致「只显示 6 篇」）。
+    """
+    citations: list[dict] = []
+    seen: set = set()
+    for m in _ANSWER_CITE_RE.finditer(answer or ""):
+        block_idx = int(m.group(1))
+        paper_id = m.group(2).lower()
+        key = (paper_id, block_idx)
+        if key in seen:
+            continue
+        seen.add(key)
+        citations.append({
+            "paper_id":  paper_id,
+            "block_idx": block_idx,
+            "heading":   "",
+            "text":      _fetch_block_text(paper_id, block_idx),
+            "type":      "paragraph",
+        })
+    return citations
+
+
 def _enrich_citations(citations: list) -> list:
     if not citations:
         return citations
@@ -1113,4 +1158,15 @@ def _enrich_citations(citations: list) -> list:
         if not c.get("year"):
             c["year"] = p.year
 
-    return [c for c in citations if (c.get("text") or "").strip()]
+    # 去重（按 type + paper_id + block_idx），并过滤无正文的引用
+    seen: set = set()
+    out: list = []
+    for c in citations:
+        if not (c.get("text") or "").strip():
+            continue
+        key = (c.get("type"), c.get("paper_id"), c.get("block_idx", -1))
+        if key in seen:
+            continue
+        seen.add(key)
+        out.append(c)
+    return out

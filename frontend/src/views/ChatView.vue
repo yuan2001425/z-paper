@@ -492,11 +492,19 @@ function fillInput(text) {
 
 function onAnswerClick(e) {
   const img = e.target.closest('img')
-  if (!img) return
-  e.preventDefault()
-  resetZoom()
-  imageViewer.value.url = img.src
-  imageViewer.value.visible = true
+  if (img) {
+    e.preventDefault()
+    resetZoom()
+    imageViewer.value.url = img.src
+    imageViewer.value.visible = true
+    return
+  }
+  // 行内 [block N](paper_id) 引用 → 新标签页打开并定位到对应段落
+  const a = e.target.closest('a')
+  if (a && (a.getAttribute('href') || '').startsWith('/results/by-paper/')) {
+    e.preventDefault()
+    window.open(a.getAttribute('href'), '_blank')
+  }
 }
 
 function resetZoom() {
@@ -601,7 +609,12 @@ function formatArgs(args) {
 
 function renderAnswer(text) {
   if (!text) return ''
-  return marked.parse(text)
+  // 把 [block N](paper_id) 引用转成可点击跳转的徽章链接（¶ 表示段落，与底部引用卡片一致）
+  const linked = text.replace(
+    /\[block\s*(\d+)\]\(([0-9a-fA-F-]{36})\)/g,
+    (_, n, id) => `[¶${n}](/results/by-paper/${id}?block=${n})`
+  )
+  return marked.parse(linked)
 }
 
 function formatTime(t) {
@@ -953,6 +966,29 @@ onUnmounted(() => {
 .ai-answer :deep(table) { border-collapse: collapse; width: 100%; margin: 0.5em 0; font-size: 0.88em; }
 .ai-answer :deep(th), .ai-answer :deep(td) { border: 1px solid #e4e7ed; padding: 5px 10px; text-align: left; }
 .ai-answer :deep(th) { background: #f5f7fa; font-weight: 600; }
+
+/* 行内引用徽章（[block N](paper_id) → ¶N 胶囊） */
+.ai-answer :deep(a[href^="/results/by-paper/"]) {
+  display: inline-block;
+  background: #ecf5ff;
+  color: #409eff;
+  border: 1px solid #d9ecff;
+  border-radius: 4px;
+  padding: 0 5px;
+  margin: 0 2px;
+  font-size: 12px;
+  line-height: 1.6;
+  font-weight: 500;
+  text-decoration: none;
+  cursor: pointer;
+  white-space: nowrap;
+  transition: background 0.15s ease, border-color 0.15s ease, color 0.15s ease;
+}
+.ai-answer :deep(a[href^="/results/by-paper/"]:hover) {
+  background: #d9ecff;
+  border-color: #b3d8ff;
+  color: #337ecc;
+}
 
 /* 图片样式 */
 .ai-answer :deep(img) {

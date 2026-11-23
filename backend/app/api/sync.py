@@ -32,7 +32,7 @@ from app.models.job import JobStatus, TranslationJob
 
 router = APIRouter()
 
-SYNC_APP_VERSION = "3.0.0"
+SYNC_APP_VERSION = "3.0.1"
 SYNC_TTL_MINUTES = 15
 DISCOVERY_PORT = 37621
 _pending_requests: dict[str, dict] = {}

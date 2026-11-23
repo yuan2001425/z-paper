@@ -219,6 +219,10 @@ If discovery cannot find the other device, check that the system firewall allows
 
 ## Changelog
 
+### v3.0.1
+- **Clickable inline citations**: paragraph references now use the standard `[block N](paper_id)` markdown link, rendered as a `¶N` badge; clicking opens the paper in a new tab and scrolls to the exact paragraph.
+- **Complete citation cards**: citations are now extracted from the answer text precisely (previously each tool only collected the top 3 and section-read produced none, showing only ~6 papers).
+
 ### v3.0.0
 - **Knowledge base chat overhaul (inspired by Claude Code architecture)**: rewritten system prompt — parallel tool calls, "locate → count → read" workflow, TodoWrite task planning, and output style guidance.
 - **Search recall rework**: removed result caps (return every match); English multi-word queries now use AND semantics (previously OR caused false positives); grep-style count / files_with_matches / content modes, `-C` context, `offset` paging; `get_paper_section` prefixes each paragraph with `[block_idx]` (cat -n equivalent).
