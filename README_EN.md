@@ -207,6 +207,12 @@ If discovery cannot find the other device, check that the system firewall allows
 
 ## Changelog
 
+### v2.2.2
+- **Vision model upgrade**: The Qwen vision model is upgraded from the deprecated `qwen3-vl-flash` to the multimodal `qwen3.8-flash`, with thinking mode disabled (`enable_thinking: false`) to reduce latency and token usage.
+- **Settings page redesign**: API settings are grouped by DeepSeek / Alibaba Bailian / MinerU; model names and API base URLs are now editable (with a confirmation dialog), and the page uses a left-right layout (settings on the left, data sync on the right).
+- **Upgrade config migration**: After an upgrade, model names and API base URLs are reset to new defaults while saved API keys are preserved.
+- **Slimmer package**: Switched to a standard Python 3.12.7 embeddable runtime with clean dependencies, significantly reducing installer size and avoiding Anaconda environment bloat.
+
 ### v2.2.1
 - **Known bug fixes**: Fixed Same-WLAN sync failures caused by very long PDF filenames being extracted under Windows temporary directories. Sync bundles now store files under short internal paths and restore original upload paths through the manifest.
 - **More tolerant sync import**: Export skips upload files that are already missing on the source device. Import records and skips individual missing bundle files instead of failing the whole 800 MB-class sync.

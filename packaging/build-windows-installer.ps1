@@ -4,7 +4,7 @@ $Root = Resolve-Path (Join-Path $PSScriptRoot "..")
 $BuildRoot = Join-Path $Root "packaging\build"
 $Stage = Join-Path $BuildRoot "app"
 $InstallerDir = Join-Path $Root "installer"
-$AppVersion = "2.2.1"
+$AppVersion = "2.2.2"
 
 function Copy-Tree($Source, $Destination, [string[]]$ExcludeDirs = @(), [string[]]$ExcludeFiles = @()) {
     New-Item -ItemType Directory -Force -Path $Destination | Out-Null
@@ -26,6 +26,8 @@ function Get-InnoCompiler {
     $candidates = @(
         "C:\Program Files (x86)\Inno Setup 6\ISCC.exe",
         "C:\Program Files\Inno Setup 6\ISCC.exe",
+        "D:\Program Files (x86)\Inno Setup 6\ISCC.exe",
+        "D:\Program Files\Inno Setup 6\ISCC.exe",
         (Join-Path $env:LOCALAPPDATA "Programs\Inno Setup 6\ISCC.exe")
     )
     foreach ($candidate in $candidates) {
@@ -171,30 +173,11 @@ New-ZPaperIcon `
     (Join-Path $Stage "z-paper.ico")
 
 Write-Host "[4/6] Copying bundled Python runtime..."
-$VenvPython = Join-Path $Root "backend\venv\Scripts\python.exe"
-$BasePythonDir = Get-BasePythonDir $VenvPython
 $PortablePythonDir = Join-Path $BackendStage "python"
-$SitePackages = Join-Path $Root "backend\venv\Lib\site-packages"
-$BasePythonExcludeDirs = @(
-    "__pycache__",
-    (Join-Path $BasePythonDir "Lib\site-packages"),
-    (Join-Path $BasePythonDir "Scripts"),
-    (Join-Path $BasePythonDir "include"),
-    (Join-Path $BasePythonDir "libs"),
-    (Join-Path $BasePythonDir "tcl"),
-    (Join-Path $BasePythonDir "Lib\ensurepip"),
-    (Join-Path $BasePythonDir "Lib\idlelib"),
-    (Join-Path $BasePythonDir "Lib\lib2to3"),
-    (Join-Path $BasePythonDir "Lib\test"),
-    (Join-Path $BasePythonDir "Lib\tkinter"),
-    (Join-Path $BasePythonDir "Lib\turtledemo"),
-    (Join-Path $BasePythonDir "Lib\venv")
-)
-Copy-Tree $BasePythonDir $PortablePythonDir `
-    -ExcludeDirs $BasePythonExcludeDirs `
-    -ExcludeFiles @("*.pyc", "*.pyo", "_test*.pyd", "_tkinter.pyd", "tcl86t.dll", "tk86t.dll")
-Copy-Tree $SitePackages (Join-Path $PortablePythonDir "Lib\site-packages") `
-    -ExcludeDirs @("__pycache__") `
+$EmbedPythonDir = Join-Path $Root "python-embed312"
+
+Copy-Tree $EmbedPythonDir $PortablePythonDir `
+    -ExcludeDirs @("__pycache__", "fitz_old") `
     -ExcludeFiles @("*.pyc", "*.pyo")
 
 Remove-Item -Recurse -Force `
@@ -207,7 +190,7 @@ Remove-Item -Recurse -Force `
 Write-Host "[5/6] Verifying staged runtime..."
 Push-Location $BackendStage
 try {
-    & (Join-Path $BackendStage "python\python.exe") -c "import fastapi, uvicorn, fitz; from app.main import app; print('stage runtime ok')"
+    & (Join-Path $BackendStage "python\python.exe") -c "import sys; sys.path.insert(0, '.'); import fastapi, uvicorn, fitz; from app.main import app; print('stage runtime ok')"
 } finally {
     Pop-Location
 }

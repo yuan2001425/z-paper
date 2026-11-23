@@ -18,6 +18,7 @@ launcher/
 installer/
 dist/
 python-embed/
+python-embed312/
 packaging/build/
 icon.svg
 

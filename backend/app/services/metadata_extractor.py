@@ -145,6 +145,7 @@ class MetadataExtractor:
 
         payload = {
             "model": settings.QWEN_VL_MODEL,
+            "enable_thinking": False,
             "messages": [
                 {
                     "role": "user",

@@ -13,7 +13,7 @@ from fastapi import APIRouter, Depends
 from pydantic import BaseModel
 from sqlalchemy.orm import Session
 
-from app.config import REQUIRED_KEYS, apply_db_config, settings
+from app.config import ADVANCED_KEYS, REQUIRED_KEYS, apply_db_config, settings
 from app.database import get_db
 from app.models.app_config import AppConfig
 
@@ -27,42 +27,76 @@ def _mask(value: str) -> str:
     return value[:4] + "*" * max(0, len(value) - 4)
 
 
+def _default_of(key: str) -> str:
+    """从 Settings 模型字段读取默认值（不受 DB 覆盖影响）"""
+    field = settings.__class__.model_fields.get(key)
+    if field is None:
+        return ""
+    default = field.default
+    if default is None:
+        return ""
+    return str(default)
+
+
 # ── 读取当前配置 ──────────────────────────────────────────────────────────────
 
 @router.get("/")
 def get_settings(db: Session = Depends(get_db)):
     rows = {r.key: r.value for r in db.query(AppConfig).all()}
-    result = {}
+
+    # 密钥（脱敏显示）
+    keys = {}
     for key, label in REQUIRED_KEYS.items():
         # 优先显示 DB 里的值，其次 settings 里的值（来自 .env）
         raw = rows.get(key) or getattr(settings, key, "")
-        result[key] = {
+        keys[key] = {
             "label":      label,
             "masked":     _mask(raw),
             "configured": bool(raw),
         }
-    return result
+
+    # 模型名 / API 地址（明文显示）
+    advanced = {}
+    for key, label in ADVANCED_KEYS.items():
+        default = _default_of(key)
+        current = rows.get(key) if key in rows else default
+        advanced[key] = {
+            "label":    label,
+            "value":    current,
+            "default":  default,
+            "modified": key in rows and rows[key] != default,
+        }
+
+    return {"keys": keys, "advanced": advanced}
 
 
 # ── 保存配置 ──────────────────────────────────────────────────────────────────
 
 class SettingsPayload(BaseModel):
+    # 密钥
     DEEPSEEK_API_KEY: str = ""
     QWEN_API_KEY:     str = ""
     MINERU_API_KEY:   str = ""
+    # 模型名 / API 地址
+    DEEPSEEK_BASE_URL:       str = ""
+    DEEPSEEK_MODEL:          str = ""
+    QWEN_BASE_URL:           str = ""
+    QWEN_DASHSCOPE_BASE_URL: str = ""
+    QWEN_VL_MODEL:           str = ""
+    QWEN_IMAGE_MODEL:        str = ""
+    QWEN_IMAGE_GEN_MODEL:    str = ""
+    MINERU_BASE_URL:         str = ""
 
 
 @router.put("/")
 def update_settings(payload: SettingsPayload, db: Session = Depends(get_db)):
     updates: dict[str, str] = {
-        "DEEPSEEK_API_KEY": payload.DEEPSEEK_API_KEY.strip(),
-        "QWEN_API_KEY":     payload.QWEN_API_KEY.strip(),
-        "MINERU_API_KEY":   payload.MINERU_API_KEY.strip(),
+        k: v.strip()
+        for k, v in payload.model_dump().items()
+        if v and v.strip()  # 留空 = 不修改
     }
 
     for key, value in updates.items():
-        if not value:
-            continue  # 留空 = 不修改
         row = db.query(AppConfig).filter(AppConfig.key == key).first()
         if row:
             row.value      = value

@@ -148,6 +148,7 @@ def _extract_text(image_b64: str, media_type: str) -> list[str]:
             },
             body={
                 "model": settings.QWEN_VL_MODEL,
+                "enable_thinking": False,
                 "messages": [{
                     "role": "user",
                     "content": [
