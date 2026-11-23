@@ -31,6 +31,14 @@
 
       <!-- 右侧：对话区 -->
       <main class="chat-main">
+        <!-- 顶部悬浮栏：会话标题 + 导出 -->
+        <div v-if="currentSessionId" class="chat-topbar" :class="{ 'is-hidden': topbarHidden }">
+          <div class="chat-topbar-title" title="点击重命名" @click="renameSession">
+            <span class="chat-topbar-title-text">{{ currentSessionTitle }}</span>
+            <el-icon class="chat-topbar-edit"><EditPen /></el-icon>
+          </div>
+          <el-button size="small" :icon="TopRight" @click="exportChat">导出</el-button>
+        </div>
         <!-- 消息列表 -->
         <div class="messages-area" ref="messagesEl">
           <div v-if="messages.length === 0" class="chat-welcome">
@@ -48,7 +56,10 @@
 
             <!-- 用户消息 -->
             <div v-if="msg.role === 'user'" class="bubble user-bubble">
-              {{ msg.content }}
+              <div class="bubble-text">{{ msg.content }}</div>
+              <div v-if="msg.content" class="msg-actions">
+                <el-button size="small" text :icon="CopyDocument" @click="copyMessage(msg)">复制</el-button>
+              </div>
             </div>
 
             <!-- AI 回复 -->
@@ -119,6 +130,11 @@
                     </div>
                   </div>
                 </div>
+              </div>
+
+              <!-- 复制按钮 -->
+              <div v-if="msg.content" class="msg-actions">
+                <el-button size="small" text :icon="CopyDocument" @click="copyMessage(msg)">复制</el-button>
               </div>
             </div>
           </div>
@@ -227,9 +243,9 @@
 </template>
 
 <script setup>
-import { ref, reactive, nextTick, onMounted, onUnmounted, watch } from 'vue'
+import { ref, reactive, computed, nextTick, onMounted, onUnmounted, watch } from 'vue'
 import { ElMessage, ElMessageBox } from 'element-plus'
-import { ArrowRight, Loading } from '@element-plus/icons-vue'
+import { ArrowRight, Loading, CopyDocument, EditPen, TopRight } from '@element-plus/icons-vue'
 import { marked } from 'marked'
 import AppHeader from '@/components/AppHeader.vue'
 import api from '@/api/index.js'
@@ -247,6 +263,14 @@ const paperTitles      = reactive({}) // paper_id → title cache
 
 const expandedSteps     = reactive({})
 const expandedCitations = reactive({})
+
+// 顶部悬浮栏
+const topbarHidden = ref(false)
+let _lastScrollTop = 0
+const currentSessionTitle = computed(() => {
+  const s = sessions.value.find(x => x.id === currentSessionId.value)
+  return s?.title || '新对话'
+})
 
 const imageViewer  = ref({ visible: false, url: '' })
 const editingImage = ref({ url: '', instruction: '' })
@@ -276,6 +300,17 @@ function updateMmViewport() {
 
 function onMessagesScroll() {
   updateMmViewport()
+  const el = messagesEl.value
+  if (!el) return
+  const st = el.scrollTop
+  if (st < 8) {
+    topbarHidden.value = false
+  } else if (st > _lastScrollTop + 4) {
+    topbarHidden.value = true
+  } else if (st < _lastScrollTop - 4) {
+    topbarHidden.value = false
+  }
+  _lastScrollTop = st
 }
 
 function jumpToMessage(msgId) {
@@ -414,6 +449,21 @@ function handleStreamEvent(event, aiMsg) {
       break
     }
 
+    case 'subagent_start':
+      for (const tid of (event.tasks || [])) {
+        aiMsg.tool_calls.push({ name: 'subagent', args: { task: tid }, running: true, subagent: true, task_id: tid })
+      }
+      expandedSteps[aiMsg.id] = true
+      nextTick(scrollToBottom)
+      break
+
+    case 'subagent_done': {
+      const last = [...aiMsg.tool_calls].reverse().find(t => t.subagent && t.running && t.task_id === event.task_id)
+      if (last) last.running = false
+      nextTick(scrollToBottom)
+      break
+    }
+
     case 'answer_chunk':
       aiMsg.content += event.content
       nextTick(scrollToBottom)
@@ -530,6 +580,7 @@ function toolLabel(name) {
     query_database:        '数据库查询',
     generate_image:        '生成图片',
     edit_image:            '编辑图片',
+    subagent:              '并行研究',
   }
   return map[name] || name
 }
@@ -544,6 +595,7 @@ function formatArgs(args) {
   if (args.block_idx !== undefined)  parts.push(`段落 #${args.block_idx}`)
   if (args.paper_id && !args.query && !args.keyword && !args.heading)
     parts.push(`论文 ${String(args.paper_id).slice(0, 8)}…`)
+  if (args.task)                    parts.push(String(args.task))
   return parts.join(' · ')
 }
 
@@ -555,6 +607,50 @@ function renderAnswer(text) {
 function formatTime(t) {
   if (!t) return ''
   return new Date(t).toLocaleString('zh-CN', { month: '2-digit', day: '2-digit', hour: '2-digit', minute: '2-digit' })
+}
+
+function absolutizeImages(text) {
+  if (!text) return text
+  const origin = window.location.origin
+  // 把相对图片地址 /uploads/... 转为本机绝对地址，粘贴后可直接访问
+  return text.replace(/\/uploads\//g, `${origin}/uploads/`)
+}
+
+async function copyMessage(msg) {
+  const text = msg.content || ''
+  if (!text) return
+  try {
+    await navigator.clipboard.writeText(absolutizeImages(text))
+    ElMessage.success('已复制')
+  } catch {
+    ElMessage.warning('复制失败，请手动复制')
+  }
+}
+
+function exportChat() {
+  if (!messages.value.length || !currentSessionId.value) return
+  const a = document.createElement('a')
+  a.href = `/api/v1/chat/sessions/${currentSessionId.value}/export`
+  a.click()
+}
+
+async function renameSession() {
+  if (!currentSessionId.value) return
+  const session = sessions.value.find(s => s.id === currentSessionId.value)
+  try {
+    const { value } = await ElMessageBox.prompt('输入新的会话名称', '重命名', {
+      inputValue: session?.title || '',
+      inputPlaceholder: '会话名称',
+      confirmButtonText: '确定',
+      cancelButtonText: '取消',
+      inputValidator: (v) => (v && v.trim() ? true : '名称不能为空'),
+    })
+    if (value && value.trim()) {
+      await api.patch(`/chat/sessions/${currentSessionId.value}`, { title: value.trim() })
+      await loadSessions()
+      ElMessage.success('已重命名')
+    }
+  } catch { /* 用户取消 */ }
 }
 
 function openPaperNewTab(paperId) {
@@ -688,6 +784,43 @@ onUnmounted(() => {
   overflow: hidden;
 }
 
+/* 顶部悬浮栏 */
+.chat-topbar {
+  flex-shrink: 0;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  padding: 8px 20px;
+  background: #fff;
+  border-bottom: 1px solid #e4e7ed;
+  overflow: hidden;
+  max-height: 60px;
+  transition: max-height 0.25s ease, opacity 0.25s ease;
+}
+.chat-topbar.is-hidden {
+  max-height: 0;
+  opacity: 0;
+  border-bottom-color: transparent;
+}
+.chat-topbar-title {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  min-width: 0;
+  cursor: pointer;
+  font-weight: 600;
+  color: #303133;
+  user-select: none;
+}
+.chat-topbar-title:hover { color: #409eff; }
+.chat-topbar-title-text {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.chat-topbar-edit { font-size: 14px; color: #909399; flex-shrink: 0; }
+
 .messages-area {
   flex: 1;
   overflow-y: auto;
@@ -719,6 +852,17 @@ onUnmounted(() => {
 .message-row { display: flex; }
 .message-row.user { justify-content: flex-end; }
 .message-row.assistant { justify-content: flex-start; }
+
+.msg-actions {
+  display: flex;
+  justify-content: flex-end;
+  margin-top: 8px;
+  padding-top: 6px;
+  border-top: 1px solid rgba(0,0,0,0.06);
+}
+.msg-actions .el-button { color: #909399; }
+.user-bubble .msg-actions { border-top-color: rgba(255,255,255,0.25); }
+.user-bubble .msg-actions .el-button { color: rgba(255,255,255,0.9); }
 
 .bubble {
   max-width: 72%;

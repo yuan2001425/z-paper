@@ -5,12 +5,16 @@
     shadow="hover"
     @click="handleClick"
   >
-    <!-- 批量模式勾选框 -->
-    <div v-if="batchMode" class="card-checkbox" @click.stop="$emit('toggle-select')">
-      <el-checkbox :model-value="selected" />
+    <div class="card-header">
+      <!-- 批量模式勾选框 -->
+      <el-checkbox
+        v-if="batchMode"
+        :model-value="selected"
+        class="card-checkbox"
+        @click.stop="$emit('toggle-select')"
+      />
+      <div class="paper-title">{{ paper.title || '（无标题）' }}</div>
     </div>
-
-    <div class="paper-title">{{ paper.title || '（无标题）' }}</div>
     <div v-if="paper.title_zh" class="paper-title-zh">{{ paper.title_zh }}</div>
     <div class="paper-meta">
       <span v-if="paper.year" class="year">{{ paper.year }}</span>
@@ -66,11 +70,19 @@ function handleClick() {
   outline-offset: 1px;
 }
 
+.card-header {
+  display: flex;
+  align-items: flex-start;
+  gap: 8px;
+  margin-bottom: 0;
+}
+.card-header .paper-title {
+  flex: 1;
+  min-width: 0;
+}
 .card-checkbox {
-  position: absolute;
-  top: 10px;
-  left: 10px;
-  z-index: 1;
+  flex-shrink: 0;
+  margin-top: 2px;
 }
 
 .paper-title    { font-weight: 600; font-size: 0.95rem; color: #303133; line-height: 1.4; }

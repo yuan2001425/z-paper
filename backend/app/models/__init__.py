@@ -8,3 +8,4 @@ from app.models.domain_glossary import DomainGlossary
 from app.models.chat import ChatSession, ChatMessage
 from app.models.app_config import AppConfig
 from app.models.folder import VirtualFolder, PaperFolderMapping
+from app.models.memory import Memory

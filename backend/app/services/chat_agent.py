@@ -6,12 +6,13 @@ chat_agent.py — 知识库对话 Agent 主逻辑
   L2 温数据  — 最近其他会话的 auto_summary，注入系统 prompt
   L3 冷数据  — 所有历史对话（通过 search_chat_history 工具随时可查）
 
-五级上下文压缩（参照 Claude Code）：
-  L1 剪裁   — 截断旧 tool 消息 content（>4 轮触发，无 LLM）
-  L2 微压缩  — 折叠旧 tool_call+result 对为单行摘要（>8 轮，无 LLM）
-  L3 折叠   — 截短旧 user/assistant 消息（>12 轮，无 LLM）
-  L4 自动压缩 — LLM 全量摘要旧轮（>16 轮，生成 auto_summary）
-  L5 应急压缩 — 强制截断（字符数超限或 413 错误）
+五级上下文压缩（参照 Claude Code compact / autoCompact / microCompact，全部按估计 token 数触发）：
+  L1 剪裁   — 超过 SNIP_TOKEN_THRESHOLD 后截断旧 tool 结果（microcompact 等价，无 LLM）
+  L2 微压缩  — 超过 MICRO_TOKEN_THRESHOLD 后折叠旧 tool_call+result 对（无 LLM）
+  L3 折叠   — 超过 FOLD_TOKEN_THRESHOLD 后截短旧消息（无 LLM）
+  L4 自动压缩 — 超过 L4_TOKEN_THRESHOLD 后用 session memory 摘要旧轮（sessionMemoryCompact：
+               优先用已维护的 session memory，无才回退 LLM 摘要）
+  L5 应急压缩 — 超过 L5_TOKEN_THRESHOLD 强制截断，或 413 错误（reactiveCompact）
   熔断器    — L4 连续失败 3 次后停止压缩尝试
 """
 
@@ -25,20 +26,29 @@ from app.config import settings
 from app.database import SessionLocal
 from app.models.paper import Paper
 from app.models.user_glossary import UserGlossary
-from app.services.chat_tools import TOOL_SPECS, execute_tool
+from app.services.chat_tools import TOOL_SPECS, execute_tool, get_todos
+from app.services import memory as memory_svc
+from app.services.session_memory import (
+    update_session_memory as _update_session_memory_impl,
+    should_update_memory,
+    render_for_injection,
+)
 
 logger = logging.getLogger(__name__)
 
 # ── 压缩阈值常量 ───────────────────────────────────────────────────────────────
-SNIP_THRESHOLD       = 4      # L1：>N user turns 后截断旧 tool 结果
-MICRO_THRESHOLD      = 8      # L2：>N turns 后折叠旧工具调用对
-FOLD_THRESHOLD       = 12     # L3：>N turns 后截短旧消息
-AUTO_THRESHOLD       = 16     # L4：>N turns 触发 LLM 全量压缩
-PRESERVE_RECENT      = 3      # 所有级别保留最近 N 轮原样
-MAX_COMPACT_FAILURES = 3      # 熔断：L4 连续失败次数上限
-EMERGENCY_CHAR_LIMIT = 80_000 # L5：消息总字符数超限触发应急截断
-MAX_TOOL_ITERATIONS       = 16    # 单次回答最多工具调用轮数
-MAX_QUERY_DB_FAILURES     = 3     # query_database 连续失败次数上限（熔断）
+# 全部按「估计 token 数」触发（对标 autoCompact / microCompact），而非按轮数——
+# 轮数无法反映真实上下文压力：一次大章节读取(数千字)与一句寒暄都算一轮。
+# DeepSeek deepseek-chat 上下文约 64k token，留 12k+ 给输出与最近消息。
+PRESERVE_RECENT       = 3      # 所有级别保留最近 N 轮原样
+MAX_COMPACT_FAILURES  = 3      # 熔断：L4 连续失败次数上限
+SNIP_TOKEN_THRESHOLD  = 12_000 # L1：超过后截断旧 tool 结果（microcompact 等价）
+MICRO_TOKEN_THRESHOLD = 18_000 # L2：超过后折叠旧工具调用对
+FOLD_TOKEN_THRESHOLD  = 24_000 # L3：超过后截短旧消息
+L4_TOKEN_THRESHOLD    = 30_000 # L4：超过后 session-memory 压缩（sessionMemoryCompact）
+L5_TOKEN_THRESHOLD    = 45_000 # L5：超过后应急截断（reactiveCompact）
+MAX_TOOL_ITERATIONS   = 16     # 单次回答最多工具调用轮数
+MAX_QUERY_DB_FAILURES = 3      # query_database 连续失败次数上限（熔断）
 
 _TIMEOUT_TOOL   = httpx.Timeout(connect=15, read=90,  write=30, pool=10)
 _TIMEOUT_STREAM = httpx.Timeout(connect=15, read=180, write=30, pool=10)
@@ -47,45 +57,47 @@ _TIMEOUT_STREAM = httpx.Timeout(connect=15, read=180, write=30, pool=10)
 # ── System Prompt ─────────────────────────────────────────────────────────────
 
 _STATIC_SYSTEM = """\
-You are a personal academic research assistant helping the user understand their paper library.
+你是一名个人学术研究助手，帮助用户阅读、理解、总结其论文库。你的任务是读论文并回答/总结，不做写文件或改代码。
 
-Core rules:
-1. ALWAYS call at least one tool before giving any answer. No exceptions. Even if you think the question is off-topic, still search.
-2. When citing content, always mention: paper title, section, and relevant text.
-3. Answer in Chinese unless the user writes in English.
-4. For complex questions, make multiple tool calls to gather comprehensive information.
+# 核心规则
+1. 回答前必须先调用至少一个工具去查证。即使问题看似离题，也要先搜索。
+2. 引用内容时用「论文标题 + block_idx」定位（如「《XX》block 12」或「论文A:12」），让用户能跳到原文。
+3. 除非用户用英文提问，否则用中文回答。
+4. 独立的工具调用要一次性并行发起（见下），不要串行等待。
 
-Tool selection strategy:
-- To find SPECIFIC content (a concept, result, method, claim): use search_in_paper(keyword) — it searches ALL sections including Introduction, which often contains key contributions and definitions. Never skip a section based on its title.
-- To read a COMPLETE section: use get_paper_section — it returns the full concatenated text from that heading to the next same-level heading with no paragraph limit.
-- get_paper_outline is only for understanding overall structure, NOT for deciding which sections to skip.
-- For cross-paper questions ("which papers discuss X"): use search_across_papers instead of calling search_in_paper repeatedly. If the default limit=10 might miss papers, pass a larger limit (e.g., limit=30 or limit=50).
-- When you find a relevant paragraph, use get_paragraph_context to read surrounding context.
-- When you only have a paper_id and need quick metadata: use get_paper_metadata.
-- If the user asks about past conversations: use search_chat_history.
-- query_database is a LAST RESORT tool. Only use it when ALL other tools are insufficient. Prefer the specific tools above for all standard queries.
+# 回答风格（对标 Claude Code 的 Output efficiency）
+- 直接给结论：先给答案，再给依据，不要铺垫、不要重复用户的问题。
+- 简洁、信息密度高：不废话、不凑字、不堆砌无关过程。
+- 用中文写通顺的成段文字，避免碎片化和过多符号；需要并列短事实（论文名、block_idx、数字）时才用列表/表格。
+- 关键结论讲清楚即可，不要过度展开无关细节。
 
-Critical rule about annotations (批注):
-- Annotations are personal notes written by the USER. They can contain ANYTHING: names, events, relationships, personal reminders — not just academic content.
-- WHENEVER a query mentions a name, a person, or any entity you do not recognise from the paper catalog, you MUST call search_annotations(query) BEFORE concluding it is not found.
-- Never say "I cannot find this" without first calling search_annotations. That is the last resort check.
+# 读论文的流程（先定位 → 看数量 → 再精读）
+- 先定位：search_across_papers（跨库搜，不知道哪篇有内容时）或 search_in_paper（单篇内找具体概念/方法/结论/定义）。
+- 再看数量：搜索结果带 total_found，先对全貌有数，再决定读哪些，不要只看前几条就下结论。search_across_papers 每页 30 条，用 offset 翻页看剩余命中。
+- 再精读：get_paper_section 读整段章节全文，get_paragraph_context 读某 block 的前后文；或直接在 search_in_paper 里传 context=N 内联返回命中块前后 N 块（grep -C 等价），省一次调用。
+- 论文按结构存储：正文块有 block_idx（相当于行号），标题块是章节（get_paper_outline 看大纲）。
+- get_paper_outline 只用于理解整体结构，不要据此跳过章节——Introduction 常含核心贡献与定义，不要跳过。
 
-Bilingual search strategy (IMPORTANT):
-- Papers store content in BOTH English (原文) and Chinese (译文).
-- When the user asks in Chinese, you MUST search with BOTH Chinese AND English keywords.
-- For terms IN the Glossary below, use the provided English equivalent.
-- For terms NOT in the Glossary, use your own knowledge to translate them to English before searching.
-- Make separate tool calls for Chinese query AND English query to maximise recall.
+# 工具使用
+- 专用工具优先于 query_database。query_database 是最后手段，只有所有专用工具都不够时才用。
+- 独立、无依赖的多个工具调用要**一次性并行发起**，提高效率；有依赖的才串行（比如先搜索拿到 paper_id，再读该 paper）。
+- 双语检索（重要）：论文同时存英文原文和中文译文。中文提问时，中英文关键词都要搜；词表里有对应英文的用英文，没有的用自己的知识翻译后再搜。中文和英文各发一次独立调用，最大化召回。
 
-Annotation search strategy:
-- When calling search_annotations, pass specific names/keywords, NOT the full sentence.
-- Annotations may be in Chinese, English, OR pinyin. For Chinese names, also try pinyin.
-- Run search_annotations for each important entity in the user's question.
+# 批注（重要）
+- 批注是用户写的个人笔记，可含任何内容（人名、事件、关系、提醒），不限于学术内容。
+- 查询提到你不认识的人名/实体时，必须先 search_annotations 再下「找不到」的结论。
+- 调用 search_annotations 时传具体名字/关键词（中文名也试拼音），不要传整句。
 
-Image tool rules:
-- When a visual diagram, concept map, or process flow would help the user understand something, proactively call generate_image with a detailed prompt (include content, layout, style, colors, in both Chinese and English). After generating, embed the result as ![description](image_url) in your answer.
-- Only call edit_image when the user explicitly asks to modify a previously generated image. Pass the exact image_url from the prior generate_image result.
-- image_url from tool results is in /uploads/chat_generated/xxx.jpg format — use it directly in Markdown image syntax.
+# 图片工具
+- 当可视化（示意图/概念图/流程图）能帮助用户理解时，主动 generate_image，生成后用 ![说明](image_url) 嵌入回答；image_url 是 /uploads/chat_generated/xxx.jpg 格式，直接用。
+- 仅当用户明确要求修改图片时用 edit_image，传入之前 generate_image 返回的 image_url。
+
+# 任务规划与并行研究
+- 复杂问题（如「对比多篇论文的方法」）先用 todo_write 拆解成步骤（搜 A → 读 A 方法段 → 搜 B → 读 B 方法段 → 综合对比），完成一项立即标记，不要攒着不标。
+- 需要读**多篇论文**、且各篇相对独立时，用 spawn_research 把每个研究点写成一个**自包含**的 prompt（指定读哪篇论文、要回答什么），一次性并行分派多个只读子代理。子代理返回总结后你再综合——这样并行更快，且不会把大段原文塞进主上下文。子代理看不到主对话，prompt 必须写清楚。
+
+# 上下文
+- 对话有无限上下文：接近上限时系统会自动压缩旧内容。你应持续通过「会话研究笔记」保留关键结论，不因压缩而遗忘。
 """
 
 
@@ -157,22 +169,65 @@ def _build_warm_context(session_id: Optional[str] = None) -> str:
         return ""
 
 
-def _system_prompt(session_id: Optional[str] = None) -> str:
-    return _STATIC_SYSTEM + _build_library_catalog() + _build_glossary_hint()
+def _system_prompt(
+    session_id: Optional[str] = None,
+    session_memory: Optional[str] = None,
+    user_message: str = "",
+) -> str:
+    parts = [_STATIC_SYSTEM]
+
+    # 持久记忆指引 + 索引（总是注入，对标 MEMORY.md）
+    parts.append(memory_svc.MEMORY_GUIDANCE)
+    index = memory_svc.build_memory_index()
+    if index:
+        parts.append(index)
+        # 只有存在记忆时才做「按需筛选」注入 ≤5 条相关正文（对标 findRelevantMemories）
+        if user_message.strip():
+            try:
+                relevant = memory_svc.find_relevant_memories(user_message, _call_deepseek)
+                rendered = memory_svc.render_relevant_memories(relevant)
+                if rendered:
+                    parts.append(rendered)
+            except Exception as e:
+                logger.warning(f"[chat_agent] 相关记忆筛选失败: {e}")
+
+    # 会话任务清单（对标 TodoWrite 注入）
+    todos = get_todos(session_id)
+    if todos:
+        marks = {"pending": "☐", "in_progress": "▶", "completed": "☑"}
+        lines = ["\n== 当前任务清单（todo）=="]
+        for t in todos:
+            lines.append(f"- {marks.get(t.get('status'), '☐')} {t.get('content', '')}")
+        lines.append("")
+        parts.append("\n".join(lines))
+
+    # 会话研究笔记（持续累积的关键结论）
+    if session_memory:
+        parts.append(
+            "\n== 本会话研究笔记（持续累积；「关键结论」是此前已确认的完整答案，回答前优先参考）==\n"
+            + render_for_injection(session_memory)
+            + "\n"
+        )
+
+    parts.append(_build_library_catalog())
+    parts.append(_build_glossary_hint())
+    return "\n".join(parts)
 
 
 # ── DeepSeek 调用 ─────────────────────────────────────────────────────────────
 
-def _call_deepseek(messages: list[dict], use_tools: bool = True, tools: list | None = None) -> dict:
+def _call_deepseek(messages: list[dict], use_tools: bool = True, tools: list | None = None, response_format: dict | None = None) -> dict:
     payload: dict = {
         "model": settings.DEEPSEEK_MODEL,
         "messages": messages,
         "temperature": 0.3,
-        "max_tokens": 4096,
+        "max_tokens": 8192,
     }
     if use_tools:
         payload["tools"] = tools if tools is not None else TOOL_SPECS
         payload["tool_choice"] = "auto"
+    if response_format:
+        payload["response_format"] = response_format
 
     with httpx.Client(timeout=_TIMEOUT_TOOL) as client:
         resp = client.post(
@@ -186,6 +241,52 @@ def _call_deepseek(messages: list[dict], use_tools: bool = True, tools: list | N
         resp.raise_for_status()
 
     return resp.json()["choices"][0]["message"]
+
+
+def update_session_memory(
+    session_memory: Optional[str],
+    user_message: str,
+    answer: str,
+    tool_calls: Optional[list] = None,
+) -> str:
+    """会话研究笔记维护入口（忠实对标 Claude Code sessionMemory）。
+
+    仅在本轮有实质进展时（回答够长，或调用了工具）才更新，避免寒暄轮污染笔记；
+    实际的结构化增量更新在 app.services.session_memory 中。
+    """
+    if not should_update_memory(answer, bool(tool_calls)):
+        return session_memory or ""
+    return _update_session_memory_impl(
+        session_memory or "",
+        user_message,
+        answer,
+        _call_deepseek,
+    )
+
+
+def extract_durable_memories(user_message: str, answer: str, tool_calls: Optional[list] = None) -> int:
+    """轮末提取跨会话持久记忆（对标 Claude Code extractMemories），返回保存条数。
+
+    与 session memory 分工：session memory 是「本会话内」的研究笔记（会话结束即失去意义），
+    持久记忆是「跨会话」的用户画像/偏好/研究主题/外部资源指针，长期有效。
+
+    互斥（对标 extractMemories 的 hasMemoryWritesSince）：若本轮 agent 已用 save_memory
+    主动存过记忆，则跳过后台提取，避免重复存。
+    """
+    if tool_calls and any(tc.get("name") == "save_memory" for tc in tool_calls):
+        return 0
+    try:
+        items = memory_svc.extract_memories(user_message, answer, _call_deepseek)
+        saved = 0
+        for it in items:
+            memory_svc.save_memory(it["type"], it["name"], it["description"], it["content"])
+            saved += 1
+        if saved:
+            logger.info(f"[chat_agent] 提取 {saved} 条持久记忆")
+        return saved
+    except Exception as e:
+        logger.warning(f"[chat_agent] extract_durable_memories 失败: {e}")
+        return 0
 
 
 import re as _re
@@ -208,12 +309,12 @@ def _extract_dsml_tool_calls(content: str) -> list[dict]:
     return calls
 
 
-def _iter_raw_chunks(messages: list[dict]) -> Generator[str, None, None]:
+def _iter_raw_chunks(messages: list[dict], state: dict | None = None) -> Generator[str, None, None]:
     payload: dict = {
         "model":       settings.DEEPSEEK_MODEL,
         "messages":    messages,
         "temperature": 0.3,
-        "max_tokens":  4096,
+        "max_tokens":  8192,
         "stream":      True,
         "tools":       TOOL_SPECS,
         "tool_choice": "none",
@@ -237,9 +338,17 @@ def _iter_raw_chunks(messages: list[dict]) -> Generator[str, None, None]:
                 if raw == "[DONE]":
                     break
                 try:
-                    content = json.loads(raw)["choices"][0]["delta"].get("content") or ""
+                    obj = json.loads(raw)
+                    choice = obj["choices"][0]
+                    content = choice.get("delta", {}).get("content") or ""
                     if content:
                         yield content
+                    fr = choice.get("finish_reason")
+                    if fr:
+                        if state is not None:
+                            state["finish_reason"] = fr
+                        if fr == "length":
+                            logger.warning("[chat_agent] 流式回答被 max_tokens 截断（finish_reason=length）")
                 except Exception:
                     pass
 
@@ -248,13 +357,13 @@ _DSML_START    = "<\uFF5CDSML\uFF5C"
 _DSML_FC_CLOSE = "</\uFF5CDSML\uFF5Cfunction_calls>"
 
 
-def _stream_guarded(messages: list[dict]) -> Generator:
+def _stream_guarded(messages: list[dict], state: dict | None = None) -> Generator:
     buf     = ""
     dsml    = ""
     in_dsml = False
     keep    = len(_DSML_START) - 1
 
-    for chunk in _iter_raw_chunks(messages):
+    for chunk in _iter_raw_chunks(messages, state):
         if in_dsml:
             dsml += chunk
             if _DSML_FC_CLOSE in dsml:
@@ -285,12 +394,13 @@ def _stream_guarded(messages: list[dict]) -> Generator:
 
 # ── 五级压缩系统 ──────────────────────────────────────────────────────────────
 
-def _count_user_turns(messages: list[dict]) -> int:
-    return sum(1 for m in messages if m.get("role") == "user")
-
-
 def _estimate_chars(messages: list[dict]) -> int:
     return sum(len(str(m.get("content") or "")) for m in messages)
+
+
+def _estimate_tokens(messages: list[dict]) -> int:
+    """粗略 token 估计（对标 roughTokenCountEstimation：length/4）。"""
+    return max(1, _estimate_chars(messages) // 4)
 
 
 def _get_cutoff(messages: list[dict]) -> int:
@@ -449,8 +559,32 @@ def _apply_fold(messages: list[dict]) -> list[dict]:
     return result
 
 
-def _apply_auto_compact(messages: list[dict]) -> tuple[list[dict], str]:
-    """L4：LLM 全量摘要旧轮次。返回 (压缩后消息, summary文本)。"""
+# 对标 compact/prompt.ts 的 9 段摘要结构（适配论文阅读场景）
+_COMPACT_SUMMARY_SYSTEM = """\
+你的任务是对这段研究对话做一个详细总结。总结将放在继续会话的开头，后续新消息会接在总结之后。请彻底总结，让只读总结 + 新消息的人能完全理解并继续。
+
+总结包含以下部分：
+1. 用户请求与意图：用户明确要什么、研究目标是什么
+2. 关键技术概念：涉及的重要概念、术语、方法
+3. 相关论文与章节：具体论文 + 关键 block_idx/章节定位，为什么相关
+4. 错误与修正：踩过的坑、用户纠正、失败过的检索方式
+5. 问题解决：已解决的问题、进行中的排查
+6. 所有用户消息：非工具结果的用户消息逐条列出
+7. 待办事项：尚未完成的任务
+8. 当前进展：总结前正在做什么
+9. 下一步：最可能接续的下一步
+
+请用中文，信息密度高、具体（含论文名/术语/数字），不要包含工具调用细节。"""
+
+
+def _apply_auto_compact(messages: list[dict], session_memory: Optional[str] = None) -> tuple[list[dict], str]:
+    """L4：摘要旧轮次。返回 (保留的最近消息, summary文本)。
+
+    对标 Claude Code sessionMemoryCompact：优先用「已增量维护的 session memory」作为摘要，
+    而不是当场跑一次有损 LLM 摘要——session memory 里已有结构化关键结论（关键结论逐字保留），
+    不会丢。无 session memory 时才回退到 LLM 摘要。
+    摘要不再内嵌进消息列表（改由调用方用 compaction_summary 字段注入），避免双重注入。
+    """
     cutoff = _get_cutoff(messages)
     old_msgs = messages[:cutoff]
     recent   = messages[cutoff:]
@@ -458,20 +592,21 @@ def _apply_auto_compact(messages: list[dict]) -> tuple[list[dict], str]:
     if not old_msgs:
         return messages, ""
 
-    history_text = "\n".join(
-        f"{m['role'].upper()}: {str(m.get('content',''))[:400]}"
-        for m in old_msgs
-        if m.get("role") in ("user", "assistant") and m.get("content")
-    )
+    if session_memory:
+        summary = render_for_injection(session_memory)
+    else:
+        history_text = "\n".join(
+            f"{m['role'].upper()}: {str(m.get('content',''))[:400]}"
+            for m in old_msgs
+            if m.get("role") in ("user", "assistant") and m.get("content")
+        )
+        summary_msg = _call_deepseek([
+            {"role": "system", "content": _COMPACT_SUMMARY_SYSTEM},
+            {"role": "user",   "content": history_text},
+        ], use_tools=False)
+        summary = summary_msg.get("content", "（历史已压缩）")
 
-    summary_msg = _call_deepseek([
-        {"role": "system", "content": "用3-5句中文概括以下研究对话的核心讨论内容和结论（勿包含工具调用细节）。"},
-        {"role": "user",   "content": history_text},
-    ], use_tools=False)
-    summary = summary_msg.get("content", "（历史已压缩）")
-
-    compacted = [{"role": "system", "content": f"[对话历史摘要]\n{summary}"}] + recent
-    return compacted, summary
+    return recent, summary
 
 
 def _apply_emergency_compact(messages: list[dict]) -> list[dict]:
@@ -484,6 +619,7 @@ def _apply_emergency_compact(messages: list[dict]) -> list[dict]:
 def _compress(
     messages: list[dict],
     consecutive_failures: int = 0,
+    session_memory: Optional[str] = None,
 ) -> tuple[list[dict], Optional[str], int]:
     """
     五级压缩入口。返回 (压缩后消息, summary|None, 新的连续失败计数)。
@@ -493,30 +629,29 @@ def _compress(
         logger.warning("[chat_agent] 熔断器触发：跳过压缩")
         return messages, None, consecutive_failures
 
-    turns = _count_user_turns(messages)
     summary: Optional[str] = None
 
-    # L5 应急（字符数超限）
-    if _estimate_chars(messages) > EMERGENCY_CHAR_LIMIT:
-        logger.warning("[chat_agent] L5 应急压缩：字符数超限")
+    # L5 应急（估计 token 数超限）
+    if _estimate_tokens(messages) > L5_TOKEN_THRESHOLD:
+        logger.warning("[chat_agent] L5 应急压缩：token 数超限")
         return _apply_emergency_compact(messages), None, consecutive_failures
 
-    # L1 剪裁
-    if turns > SNIP_THRESHOLD:
+    # L1 剪裁（每级压缩后重新估 token，避免过度压缩）
+    if _estimate_tokens(messages) > SNIP_TOKEN_THRESHOLD:
         messages = _apply_snip(messages)
 
     # L2 微压缩
-    if turns > MICRO_THRESHOLD:
+    if _estimate_tokens(messages) > MICRO_TOKEN_THRESHOLD:
         messages = _apply_micro_compact(messages)
 
     # L3 折叠
-    if turns > FOLD_THRESHOLD:
+    if _estimate_tokens(messages) > FOLD_TOKEN_THRESHOLD:
         messages = _apply_fold(messages)
 
-    # L4 自动压缩
-    if turns > AUTO_THRESHOLD:
+    # L4 自动压缩（session-memory）
+    if _estimate_tokens(messages) > L4_TOKEN_THRESHOLD:
         try:
-            messages, summary = _apply_auto_compact(messages)
+            messages, summary = _apply_auto_compact(messages, session_memory)
             consecutive_failures = 0
             logger.info("[chat_agent] L4 自动压缩成功")
         except Exception as e:
@@ -534,6 +669,7 @@ def run_chat_turn(
     compaction_summary: Optional[str] = None,
     session_id: Optional[str] = None,
     compact_failures: int = 0,
+    session_memory: Optional[str] = None,
 ) -> dict:
     """
     执行一轮对话（非流式）。
@@ -546,7 +682,7 @@ def run_chat_turn(
       compaction_summary — 若触发 L4 压缩则返回新摘要，否则 None
       compact_failures  — 更新后的熔断计数
     """
-    api_messages: list[dict] = [{"role": "system", "content": _system_prompt(session_id)}]
+    api_messages: list[dict] = [{"role": "system", "content": _system_prompt(session_id, session_memory, user_message)}]
     if compaction_summary:
         api_messages.append({"role": "system", "content": f"[对话历史摘要]\n{compaction_summary}"})
     api_messages.extend(history)
@@ -576,7 +712,7 @@ def run_chat_turn(
                 args = {}
 
             logger.info(f"[chat_agent] 工具: {name}({list(args.keys())})")
-            result_str = execute_tool(name, args)
+            result_str = execute_tool(name, args, session_id=session_id, call_deepseek=_call_deepseek)
 
             # query_database 熔断：连续失败超限后禁用该工具
             if name == "query_database":
@@ -615,7 +751,7 @@ def run_chat_turn(
 
     new_history = [m for m in api_messages if m.get("role") != "system"]
 
-    new_history, new_compaction, compact_failures = _compress(new_history, compact_failures)
+    new_history, new_compaction, compact_failures = _compress(new_history, compact_failures, session_memory)
 
     return {
         "answer":             answer,
@@ -633,6 +769,7 @@ def run_chat_turn_stream(
     compaction_summary: Optional[str] = None,
     session_id: Optional[str] = None,
     compact_failures: int = 0,
+    session_memory: Optional[str] = None,
 ) -> Generator[dict, None, None]:
     """
     混合模式：非流式工具循环 + 流式最终答案。
@@ -645,7 +782,7 @@ def run_chat_turn_stream(
                         "new_history": list, "compaction_summary": str|None,
                         "compact_failures": int}
     """
-    api_messages: list[dict] = [{"role": "system", "content": _system_prompt(session_id)}]
+    api_messages: list[dict] = [{"role": "system", "content": _system_prompt(session_id, session_memory, user_message)}]
     if compaction_summary:
         api_messages.append({"role": "system", "content": f"[对话历史摘要]\n{compaction_summary}"})
     api_messages.extend(history)
@@ -702,7 +839,32 @@ def run_chat_turn_stream(
             logger.info(f"[chat_agent] 工具: {name}({list(args.keys())})")
             yield {"type": "tool_start", "name": name, "args": args}
 
-            result_str = execute_tool(name, args)
+            # spawn_research 会阻塞较久（并行子代理），用后台线程 + 队列把子任务进度实时流给前端，
+            # 避免用户长时间静默（对标 Claude Code 的子代理进度通知，但结果仍同步回到本轮）
+            if name == "spawn_research":
+                import queue as _queue
+                import threading as _threading
+                _q: _queue.Queue = _queue.Queue()
+
+                def _run_spawn():
+                    try:
+                        _r = execute_tool(name, args, session_id=session_id, call_deepseek=_call_deepseek,
+                                          on_event=lambda e: _q.put(e))
+                        _q.put(("__result__", _r))
+                    except Exception as _e:
+                        _q.put(("__result__", json.dumps({"error": str(_e)}, ensure_ascii=False)))
+
+                _t = _threading.Thread(target=_run_spawn, daemon=True)
+                _t.start()
+                while True:
+                    _item = _q.get()
+                    if isinstance(_item, tuple) and len(_item) == 2 and _item[0] == "__result__":
+                        result_str = _item[1]
+                        break
+                    yield _item  # subagent_start / subagent_done 事件
+                _t.join()
+            else:
+                result_str = execute_tool(name, args, session_id=session_id, call_deepseek=_call_deepseek)
 
             # query_database 熔断
             if name == "query_database":
@@ -733,16 +895,21 @@ def run_chat_turn_stream(
                 "content":      result_str,
             })
 
-    # ── 阶段二：流式答复（遇到 DSML 继续执行工具，最多 4 次额外循环） ────
+    # ── 阶段二：流式答复（DSML 工具循环 + 截断续写） ────
     answer_parts:  list[str] = []
-    MAX_STREAM_EXTRA = 4
+    MAX_STREAM_EXTRA = 4     # DSML 工具额外循环上限
+    MAX_CONTINUE = 10        # 截断续写次数上限
 
-    for _s in range(MAX_STREAM_EXTRA + 1):
+    dsml_rounds = 0
+    continue_rounds = 0
+
+    while True:
         iter_text:  list[str]  = []
         dsml_calls: list[dict] = []
+        stream_state: dict = {}
 
         try:
-            for item in _stream_guarded(api_messages):
+            for item in _stream_guarded(api_messages, stream_state):
                 if isinstance(item, str):
                     yield {"type": "answer_chunk", "content": item}
                     iter_text.append(item)
@@ -750,7 +917,7 @@ def run_chat_turn_stream(
                 elif isinstance(item, list):
                     dsml_calls = item
         except Exception as e:
-            logger.error(f"[chat_agent] 流式答复失败 (stream_iter {_s}): {e}")
+            logger.error(f"[chat_agent] 流式答复失败: {e}")
             # L5 应急检测：413 错误
             is_413 = "413" in str(e)
             try:
@@ -766,9 +933,11 @@ def run_chat_turn_stream(
             break
 
         if dsml_calls:
+            if dsml_rounds >= MAX_STREAM_EXTRA:
+                break
             fake_tcs = [
                 {
-                    "id":       f"s{_s}_{i}",
+                    "id":       f"s{dsml_rounds}_{i}",
                     "type":     "function",
                     "function": {
                         "name":      c["name"],
@@ -787,24 +956,38 @@ def run_chat_turn_stream(
                 args = c["args"]
                 logger.info(f"[chat_agent] 流式 DSML 工具: {name}({list(args.keys())})")
                 yield {"type": "tool_start", "name": name, "args": args}
-                result_str = execute_tool(name, args)
+                result_str = execute_tool(name, args, session_id=session_id, call_deepseek=_call_deepseek)
                 tool_call_log.append({"name": name, "args": args, "result_snippet": result_str[:300]})
                 _collect_citations(name, args, result_str, citations)
                 yield {"type": "tool_done", "name": name, "snippet": result_str[:300]}
                 api_messages.append({
                     "role":         "tool",
-                    "tool_call_id": f"s{_s}_{i}",
+                    "tool_call_id": f"s{dsml_rounds}_{i}",
                     "content":      result_str,
                 })
-        else:
-            if iter_text:
-                api_messages.append({"role": "assistant", "content": "".join(iter_text)})
-            break
+            dsml_rounds += 1
+            continue
+
+        # 无 DSML：正常结束或截断续写
+        if iter_text:
+            api_messages.append({"role": "assistant", "content": "".join(iter_text)})
+
+        if stream_state.get("finish_reason") == "length":
+            if continue_rounds >= MAX_CONTINUE:
+                break
+            api_messages.append({
+                "role": "user",
+                "content": "请继续，从刚才中断的地方接着输出，不要重复已输出的内容。",
+            })
+            continue_rounds += 1
+            continue
+
+        break
 
     answer = "".join(answer_parts)
 
     new_history = [m for m in api_messages if m.get("role") != "system"]
-    new_history, new_compaction, compact_failures = _compress(new_history, compact_failures)
+    new_history, new_compaction, compact_failures = _compress(new_history, compact_failures, session_memory)
 
     yield {
         "type":               "done",

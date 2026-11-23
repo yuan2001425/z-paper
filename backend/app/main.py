@@ -7,6 +7,7 @@ setup_logging("api")
 
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles
 
 from app.config import settings, load_db_config
@@ -39,6 +40,7 @@ with engine.connect() as _conn:
     for _col, _def in [
         ("auto_summary",     "TEXT"),
         ("compact_failures", "INTEGER DEFAULT 0"),
+        ("session_memory",   "TEXT"),
     ]:
         try:
             _conn.execute(_sql_text(
@@ -137,8 +139,18 @@ def health_check():
     return {"status": "ok"}
 
 
-# ── 前端静态文件（生产模式）────────────────────────────────────────────────────
-# 只在 frontend/dist/ 存在时挂载（开发模式下用 npm run dev，无需此步）
+# ── 前端静态文件（生产模式）+ SPA fallback ────────────────────────────────────
+# 只在 frontend/dist/ 存在时启用（开发模式下用 npm run dev，无需此步）
+# 用 catch-all 路由替代 StaticFiles mount：静态资源直接返回文件，
+# 其余路径（/search、/results/... 等前端 history 路由）回退到 index.html，
+# 否则打包后直接访问或刷新非根路径会 404。
 _FRONTEND_DIST = Path(__file__).resolve().parent.parent.parent / "frontend" / "dist"
 if _FRONTEND_DIST.exists():
-    app.mount("/", StaticFiles(directory=str(_FRONTEND_DIST), html=True), name="frontend")
+    _dist_root = _FRONTEND_DIST.resolve()
+
+    @app.get("/{full_path:path}", include_in_schema=False)
+    async def serve_frontend(full_path: str):
+        candidate = (_dist_root / full_path).resolve()
+        if full_path and candidate.is_file() and _dist_root in candidate.parents:
+            return FileResponse(candidate)
+        return FileResponse(_dist_root / "index.html")

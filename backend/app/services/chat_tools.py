@@ -28,8 +28,49 @@ from app.models.paper import Paper
 from app.models.result import TranslationResult
 from app.models.annotation import Annotation
 from sqlalchemy import text as _sql_text
+from app.services import memory as memory_svc
 
 logger = logging.getLogger(__name__)
+
+
+# ── 会话任务清单（对标 TodoWrite） ─────────────────────────────────────────────
+# key = session_id，value = [{content, status: pending|in_progress|completed}]
+_TODOS: dict[str, list[dict]] = {}
+
+
+def todo_write(session_id: Optional[str], todos: list) -> str:
+    """更新会话任务清单（对标 TodoWrite：content 祈使式 + active_form 进行式，同一时刻仅一项 in_progress）。"""
+    cleaned = []
+    for t in todos or []:
+        if not isinstance(t, dict) or not t.get("content"):
+            continue
+        status = t.get("status", "pending")
+        if status not in ("pending", "in_progress", "completed"):
+            status = "pending"
+        cleaned.append({
+            "content": t["content"],
+            "active_form": (t.get("active_form") or t["content"]),
+            "status": status,
+        })
+    # 全部完成时清空列表（对标 TodoWrite：allDone → newTodos=[]）
+    if cleaned and all(c["status"] == "completed" for c in cleaned):
+        _TODOS[session_id or "_default"] = []
+        return json.dumps({
+            "todos": [],
+            "count": 0,
+            "cleared": True,
+            "message": "任务清单已全部完成并清空。请继续推进，若仍有未决事项重新拆解。",
+        }, ensure_ascii=False)
+    _TODOS[session_id or "_default"] = cleaned
+    return json.dumps({
+        "todos": cleaned,
+        "count": len(cleaned),
+        "message": "任务清单已更新。请继续用它跟踪进度：同一时刻只保持一项 in_progress，完成一项立即标记 completed。",
+    }, ensure_ascii=False)
+
+
+def get_todos(session_id: Optional[str]) -> list[dict]:
+    return _TODOS.get(session_id or "_default", [])
 
 
 # ── 内部工具函数 ───────────────────────────────────────────────────────────────
@@ -88,10 +129,62 @@ def _cutoff_index(blocks: list[dict], preserve_recent_turns: int = 3) -> int:
     return 0
 
 
+def _split_keywords(query: str) -> list[str]:
+    """把查询拆成关键词。中文无空格 → 单 token（精确子串匹配）；英文按空格分词。"""
+    q = (query or "").strip().lower()
+    return [w for w in q.split() if w]
+
+
+def _match_score(text: str, keywords: list[str]) -> tuple[bool, int]:
+    """结构化块的关键词匹配（对标 grep 的精确匹配，但允许词序变化）。
+
+    返回 (是否命中, 相关性分)：
+    - 命中 = 所有关键词都在块内出现（AND 语义，避免英文多词退化成 OR 的误召回）；
+    - 评分 = 连续短语命中最高（1000+），其次按各词出现次数累计（用于排序）。
+    """
+    if not keywords:
+        return False, 0
+    phrase = " ".join(keywords)
+    if phrase in text:
+        return True, 1000 + text.count(phrase)
+    if all(k in text for k in keywords):
+        return True, sum(text.count(k) for k in keywords)
+    return False, 0
+
+
+def _snippet(text: str, keywords: list[str], max_len: int = 150) -> str:
+    """取关键词命中位置附近的片段（对标 grep 显示命中行，而非从块开头截断）。
+
+    多关键词 AND 匹配时，优先让片段覆盖「所有关键词的跨度」（第一个到最后一个），
+    这样片段能同时看到多个命中词；跨度过大时退化为居中第一个关键词。
+    """
+    t = (text or "").strip()
+    if not t:
+        return ""
+    if len(t) <= max_len:
+        return t
+    low = t.lower()
+    poses = [low.find(k) for k in keywords]
+    poses = [p for p in poses if p >= 0]
+    if not poses:
+        return t[:max_len]
+    lo, hi = min(poses), max(poses)
+    if hi - lo <= max_len:
+        # 关键词跨度能塞进窗口：取覆盖范围，两侧留一点
+        start = max(0, lo - (max_len - (hi - lo)) // 2)
+        end = min(len(t), start + max_len)
+        start = max(0, end - max_len)
+    else:
+        # 跨度太大：居中第一个关键词
+        start = max(0, lo - max_len // 3)
+        end = min(len(t), start + max_len)
+    return ("…" if start > 0 else "") + t[start:end] + ("…" if end < len(t) else "")
+
+
 # ── 工具 1-7（原有） ────────────────────────────────────────────────────────────
 
-def search_papers(query: str, domain: Optional[str] = None, limit=10) -> str:
-    query_lower = query.lower()
+def search_papers(query: str, domain: Optional[str] = None) -> str:
+    keywords = _split_keywords(query)
     with SessionLocal() as db:
         papers = db.query(Paper).all()
 
@@ -105,13 +198,14 @@ def search_papers(query: str, domain: Optional[str] = None, limit=10) -> str:
             " ".join(p.keywords or []) if p.keywords else "",
             p.domain or "", p.journal or "",
         ])).lower()
-        score = sum(1 for word in query_lower.split() if word in searchable)
-        if score > 0:
+        matched, score = _match_score(searchable, keywords)
+        if matched:
             results.append((score, p))
 
     results.sort(key=lambda x: x[0], reverse=True)
+    # 不设数量上限：有多少匹配返回多少，避免漏掉相关论文
     output = []
-    for _, p in results[:int(limit)]:
+    for _, p in results:
         output.append({
             "paper_id": p.id,
             "title": p.title or "",
@@ -123,7 +217,9 @@ def search_papers(query: str, domain: Optional[str] = None, limit=10) -> str:
         })
 
     return json.dumps(
-        {"results": output} if output else {"results": [], "message": "未找到相关论文"},
+        {"total_found": len(output), "results": output}
+        if output else
+        {"total_found": 0, "results": [], "message": "未找到相关论文"},
         ensure_ascii=False,
     )
 
@@ -152,13 +248,13 @@ def get_paper_outline(paper_id: str) -> str:
     }, ensure_ascii=False)
 
 
-def search_in_paper(paper_id: str, query: str, section: Optional[str] = None, limit=8) -> str:
+def search_in_paper(paper_id: str, query: str, section: Optional[str] = None, context: int = 0) -> str:
     result = _get_result(paper_id)
     if not result:
         return json.dumps({"error": "未找到该论文的处理结果"}, ensure_ascii=False)
 
     blocks = result.structure_json.get("正文", [])
-    query_lower = query.lower()
+    keywords = _split_keywords(query)
 
     s_start, s_end = 0, len(blocks)
     if section:
@@ -182,22 +278,40 @@ def search_in_paper(paper_id: str, query: str, section: Optional[str] = None, li
             continue
         en, zh = b.get("文本", ""), b.get("中文文本", "")
         combined = (en + " " + zh).lower()
-        score = sum(1 for w in query_lower.split() if w in combined)
-        if score > 0:
-            matches.append({
+        matched, score = _match_score(combined, keywords)
+        if matched:
+            m = {
                 "block_idx": idx,
                 "heading_context": _heading_context(blocks, idx),
-                "text_en": en[:500],
-                "text_zh": zh[:500],
+                "text_en": _snippet(en, keywords),
+                "text_zh": _snippet(zh, keywords),
                 "score": score,
-            })
+            }
+            # 对标 grep -C：context>0 时内联返回命中块前后各 context 个块的片段，
+            # 让模型一次调用就能看到上下文，不必二次 get_paragraph_context。
+            if context > 0:
+                ctx = []
+                for j in range(max(s_start, idx - context), min(s_end, idx + context + 1)):
+                    if j == idx:
+                        continue
+                    bj = blocks[j]
+                    if bj.get("图片地址"):
+                        continue
+                    ctx.append({
+                        "block_idx": j,
+                        "text_en": (bj.get("文本", "") or "")[:100],
+                        "text_zh": (bj.get("中文文本", "") or "")[:100],
+                    })
+                if ctx:
+                    m["context"] = ctx
+            matches.append(m)
 
     matches.sort(key=lambda x: x["score"], reverse=True)
     all_annotations = _get_paper_annotations_raw(result.id)
-    keywords = query_lower.split() + (section.lower().split() if section else [])
-    relevant_annotations = _filter_relevant_annotations(all_annotations, keywords)
+    ann_keywords = keywords + (section.lower().split() if section else [])
+    relevant_annotations = _filter_relevant_annotations(all_annotations, ann_keywords)
 
-    out: dict = {"paper_id": paper_id, "matches": matches[:int(limit)]}
+    out: dict = {"paper_id": paper_id, "total_found": len(matches), "matches": matches}
     if relevant_annotations:
         out["annotations"] = relevant_annotations
         out["annotation_note"] = _annotations_note(relevant_annotations)
@@ -206,7 +320,7 @@ def search_in_paper(paper_id: str, query: str, section: Optional[str] = None, li
 
 def get_paper_section(paper_id: str, heading: str, offset: int = 0) -> str:
     """获取指定章节的完整文本内容（从该标题到下一同级/高级标题，排除图片块）。
-    返回中英文拼接后的纯文本字符串，无数量限制。
+    每段前带 [block_idx]（对标 Read 的 cat -n 行号），读完可直接用 block_idx 引用/精读。
     若章节过长可通过 offset 分页（每页 50 段）。
     """
     result = _get_result(paper_id)
@@ -248,8 +362,9 @@ def get_paper_section(paper_id: str, heading: str, offset: int = 0) -> str:
     total = len(paragraphs)
     page = paragraphs[offset: offset + PAGE_SIZE]
 
-    content_zh = "\n".join(p["text_zh"] for p in page if p["text_zh"])
-    content_en = "\n".join(p["text_en"] for p in page if p["text_en"])
+    # cat -n 风格：每段前带 [block_idx]，让 agent 读完能定位到具体块
+    content_zh = "\n".join(f"[{p['block_idx']}] {p['text_zh']}" for p in page if p["text_zh"])
+    content_en = "\n".join(f"[{p['block_idx']}] {p['text_en']}" for p in page if p["text_en"])
 
     all_annotations = _get_paper_annotations_raw(result.id)
     sec_keywords = (
@@ -266,6 +381,7 @@ def get_paper_section(paper_id: str, heading: str, offset: int = 0) -> str:
         "paragraph_count": total,
         "offset": offset,
         "has_more": (offset + PAGE_SIZE) < total,
+        "block_idx_range": [page[0]["block_idx"], page[-1]["block_idx"]] if page else None,
     }
     if relevant_annotations:
         out["annotations"] = relevant_annotations
@@ -337,9 +453,9 @@ def search_annotations(query: str) -> str:
 
 # ── 工具 8-11（新增） ──────────────────────────────────────────────────────────
 
-def search_across_papers(keyword: str, limit=10) -> str:
-    """在全库所有论文全文中搜索关键词，返回最相关的段落片段。"""
-    keyword_lower = keyword.lower()
+def search_across_papers(keyword: str, offset: int = 0) -> str:
+    """在全库所有论文全文中搜索关键词，返回全部匹配段落（不设数量上限，可 offset 翻页）。"""
+    keywords = _split_keywords(keyword)
     all_matches = []
 
     with SessionLocal() as db:
@@ -357,24 +473,51 @@ def search_across_papers(keyword: str, limit=10) -> str:
             en = b.get("文本", "")
             zh = b.get("中文文本", "")
             combined = (en + " " + zh).lower()
-            score = sum(1 for w in keyword_lower.split() if w in combined)
-            if score > 0:
+            matched, score = _match_score(combined, keywords)
+            if matched:
                 all_matches.append({
                     "paper_id": tr.paper_id,
                     "paper_title": paper.title_zh or paper.title or "",
                     "block_idx": idx,
                     "heading_context": _heading_context(blocks, idx),
-                    "text_zh": zh[:400],
-                    "text_en": en[:400],
+                    "text_zh": _snippet(zh, keywords),
+                    "text_en": _snippet(en, keywords),
                     "score": score,
                 })
 
     all_matches.sort(key=lambda x: x["score"], reverse=True)
-    return json.dumps({
+    # 聚合视图：每篇命中论文 + 命中数（对标 Grep files_with_matches）
+    agg: dict[str, int] = {}
+    for m in all_matches:
+        agg[m["paper_id"]] = agg.get(m["paper_id"], 0) + 1
+    papers = [
+        {
+            "paper_id": pid,
+            "paper_title": next(m["paper_title"] for m in all_matches if m["paper_id"] == pid),
+            "match_count": cnt,
+        }
+        for pid, cnt in sorted(agg.items(), key=lambda x: -x[1])
+    ]
+    # 内容视图（对标 Grep content + head_limit/offset 分页）：只返回一页带正文的命中，
+    # 避免几百条正文撑爆上下文。全貌由 total_found + papers 聚合给出（不设上限），
+    # 用 offset 翻页看剩余命中。
+    MAX_RESULTS = 30
+    page = all_matches[offset: offset + MAX_RESULTS]
+    out: dict = {
         "keyword": keyword,
-        "results": all_matches[:int(limit)],
         "total_found": len(all_matches),
-    }, ensure_ascii=False)
+        "papers": papers,
+        "results": page,
+        "offset": offset,
+        "limit": MAX_RESULTS,
+    }
+    if offset + MAX_RESULTS < len(all_matches):
+        out["has_more"] = True
+        out["hint"] = (
+            f"已显示第 {offset}–{offset + len(page) - 1} 条，共 {len(all_matches)} 条命中。"
+            f"用 offset={offset + MAX_RESULTS} 继续翻页；或 search_in_paper(paper_id, keyword) 精读单篇。"
+        )
+    return json.dumps(out, ensure_ascii=False)
 
 
 def get_paragraph_context(paper_id: str, block_idx: int, window: int = 2) -> str:
@@ -592,6 +735,9 @@ TOOL_REGISTRY = {
     "query_database":        query_database,
     "generate_image":        generate_image,
     "edit_image":            edit_image,
+    "save_memory":           memory_svc.save_memory,
+    "list_memories":         memory_svc.list_memories,
+    "delete_memory":         memory_svc.delete_memory,
 }
 
 TOOL_SPECS = [
@@ -599,13 +745,12 @@ TOOL_SPECS = [
         "type": "function",
         "function": {
             "name": "search_papers",
-            "description": "Search paper titles, abstracts, and keywords to find relevant papers. Start with this when the user asks about a topic or paper.",
+            "description": "Search paper titles, abstracts, and keywords to find relevant papers. Returns ALL matching papers (no limit). Start with this when the user asks about a topic or paper.",
             "parameters": {
                 "type": "object",
                 "properties": {
                     "query": {"type": "string", "description": "Search keywords"},
                     "domain": {"type": "string", "description": "Optional academic domain filter"},
-                    "limit": {"type": "integer", "description": "Max results (default 10)", "default": 10},
                 },
                 "required": ["query"],
             },
@@ -629,14 +774,14 @@ TOOL_SPECS = [
         "type": "function",
         "function": {
             "name": "search_in_paper",
-            "description": "Search for specific content in a single paper's full text. Also returns relevant user annotations. Never skip Introduction — it often contains core contributions.",
+            "description": "Search for specific content in a single paper's full text. Returns ALL matching blocks (no limit), each with block_idx + short snippet; also returns relevant user annotations. Pass context=N to inline-return N surrounding blocks around each match (like grep -C), so you can see context without a second get_paragraph_context call. Never skip Introduction — it often contains core contributions.",
             "parameters": {
                 "type": "object",
                 "properties": {
                     "paper_id": {"type": "string"},
-                    "query": {"type": "string", "description": "Keywords to search"},
+                    "query": {"type": "string", "description": "Keywords to search (AND semantics: all words must appear)"},
                     "section": {"type": "string", "description": "Optional: limit search to a specific section heading"},
-                    "limit": {"type": "integer", "description": "Max results to return (default 8)", "default": 8},
+                    "context": {"type": "integer", "description": "Optional: number of blocks before/after each match to include inline (grep -C equivalent)", "default": 0},
                 },
                 "required": ["paper_id", "query"],
             },
@@ -704,12 +849,12 @@ TOOL_SPECS = [
         "type": "function",
         "function": {
             "name": "search_across_papers",
-            "description": "Search a keyword across ALL papers' full text at once. Use for cross-paper questions like 'which papers discuss X' or when you don't know which paper contains specific content.",
+            "description": "Search a keyword across ALL papers' full text at once. Returns total_found + a per-paper aggregation view (which papers matched + match count, no limit) + a page of top content results (30 per page). Use offset=N to page through more content results. Use for cross-paper questions like 'which papers discuss X' or when you don't know which paper contains specific content.",
             "parameters": {
                 "type": "object",
                 "properties": {
-                    "keyword": {"type": "string", "description": "Keyword(s) to search across all papers"},
-                    "limit": {"type": "integer", "description": "Max results (default 10)", "default": 10},
+                    "keyword": {"type": "string", "description": "Keyword(s) to search across all papers (AND semantics)"},
+                    "offset": {"type": "integer", "description": "Skip first N content results for pagination (default 0)", "default": 0},
                 },
                 "required": ["keyword"],
             },
@@ -835,10 +980,109 @@ RULES:
             },
         },
     },
+    {
+        "type": "function",
+        "function": {
+            "name": "todo_write",
+            "description": "创建/更新会话任务清单，用于拆解复杂问题（如「对比多篇论文的方法」）。todos 是完整列表，每项含 content（祈使式，如「读 A 的方法段」）、active_form（进行式，如「正在读 A 的方法段」）和 status。同一时刻只有一项 in_progress；开始做就标 in_progress，完成立即标 completed（不要攒着）；全部完成则列表清空。",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "todos": {
+                        "type": "array",
+                        "description": "完整的任务列表",
+                        "items": {
+                            "type": "object",
+                            "properties": {
+                                "content": {"type": "string", "description": "祈使式任务描述"},
+                                "active_form": {"type": "string", "description": "进行式描述（执行中显示）"},
+                                "status": {"type": "string", "enum": ["pending", "in_progress", "completed"]},
+                            },
+                            "required": ["content", "status"],
+                        },
+                    },
+                },
+                "required": ["todos"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "save_memory",
+            "description": "保存/更新一条跨会话持久记忆。当了解到用户的角色/偏好/研究主题/外部资源指针，或用户明确要求记住时使用。name 用英文短横线 slug（同名字覆盖更新）。",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "type": {"type": "string", "enum": ["user", "feedback", "project", "reference"], "description": "记忆类型"},
+                    "name": {"type": "string", "description": "英文短横线 slug，如 user_research_domain"},
+                    "description": {"type": "string", "description": "一行描述，用于日后判断相关性"},
+                    "content": {"type": "string", "description": "记忆正文（feedback/project 用「规则 + Why + How to apply」结构）"},
+                },
+                "required": ["type", "name", "content"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "list_memories",
+            "description": "列出所有跨会话持久记忆（含正文），用于检查是否已有可更新的记忆、或用户要求回忆时查询。",
+            "parameters": {"type": "object", "properties": {}},
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "delete_memory",
+            "description": "删除一条跨会话持久记忆（用户要求忘记、或记忆已过时/错误时使用）。",
+            "parameters": {
+                "type": "object",
+                "properties": {"name": {"type": "string", "description": "记忆的 name slug"}},
+                "required": ["name"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "spawn_research",
+            "description": "并行分派多个只读研究子代理，各自搜索/阅读论文库并返回总结。用于需要读多篇论文的复杂问题（如「对比多篇论文的方法」）：把每个独立研究点写成一个自包含的 prompt，一次性并行分派，子代理返回总结后你再综合。子代理看不到主对话，所以每个 prompt 要写清楚读哪篇论文、要回答什么。",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "tasks": {
+                        "type": "array",
+                        "description": "要并行分派的研究子任务列表",
+                        "items": {
+                            "type": "object",
+                            "properties": {
+                                "task_id": {"type": "string", "description": "简短标识，用于区分各子任务结果"},
+                                "prompt": {"type": "string", "description": "自包含的研究问题：指定读哪篇论文/哪个方面、要回答什么（子代理看不到主对话）"},
+                            },
+                            "required": ["prompt"],
+                        },
+                    },
+                },
+                "required": ["tasks"],
+            },
+        },
+    },
 ]
 
 
-def execute_tool(name: str, args: dict) -> str:
+def execute_tool(name: str, args: dict, session_id: Optional[str] = None, call_deepseek=None, on_event=None) -> str:
+    # todo_write 需要会话上下文来存储任务清单，特殊处理
+    if name == "todo_write":
+        return todo_write(session_id, (args or {}).get("todos", []))
+
+    # spawn_research 需要并发跑子代理（需 call_deepseek），特殊处理（惰性导入避免循环依赖）
+    if name == "spawn_research":
+        if call_deepseek is None:
+            return json.dumps({"error": "spawn_research 需要 call_deepseek"}, ensure_ascii=False)
+        from app.services import subagent
+        return subagent.spawn_research((args or {}).get("tasks", []), call_deepseek, execute_tool, TOOL_SPECS, on_event=on_event)
+
     func = TOOL_REGISTRY.get(name)
     if not func:
         return json.dumps({"error": f"未知工具: {name}"}, ensure_ascii=False)

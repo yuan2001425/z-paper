@@ -90,21 +90,26 @@ Tool results do not need to permanently occupy context. During compression, only
 
 Search tools locate; read tools deep-read. The Agent first locates, then reads on demand — rather than loading everything upfront.
 
-### 14 Tools Covering Navigation and Creation
+### 19 Tools Covering Navigation, Memory, and Creation
 
 | Tool | Function |
 | --- | --- |
 | `search_papers` | Search the full library by title / abstract / keywords |
+| `search_across_papers` | **Cross-library** full-text search — returns match count + per-paper aggregation + content (offset paging) |
+| `search_in_paper` | Keyword search within a single paper (AND semantics; `context=N` for inline context, grep -C equivalent) |
 | `get_paper_outline` | Get a paper's section outline |
-| `get_paper_metadata` | Quickly retrieve abstract / authors / keywords |
-| `search_in_paper` | Keyword search within a single paper's full text |
-| `search_across_papers` | **Cross-library** full-text search across all papers at once |
-| `get_paper_section` | Retrieve a section's **complete text** (no paragraph limit) |
+| `get_paper_section` | Retrieve a section's **complete text**, each paragraph prefixed with `[block_idx]` (cat -n equivalent) |
 | `get_paragraph_context` | Get surrounding paragraphs around a matched block |
+| `get_paper_metadata` | Quickly retrieve abstract / authors / keywords |
 | `get_references` | Retrieve the reference list |
 | `get_annotations` | Get all personal annotations for a paper |
 | `search_annotations` | **Cross-library** annotation search (Chinese tokenization + pinyin) |
 | `search_chat_history` | Search historical conversation records |
+| `spawn_research` | **Parallel research subagents**: dispatch multiple read-only subagents concurrently with live progress |
+| `todo_write` | Create/update a task list for complex multi-paper comparisons |
+| `save_memory` | Save cross-session persistent memory (user / feedback / project / reference) |
+| `list_memories` | List all cross-session persistent memories |
+| `delete_memory` | Delete a cross-session persistent memory |
 | `query_database` | Execute custom SQL queries (last resort for complex queries) |
 | `generate_image` | Generate images from descriptions (visualize concepts / workflows) |
 | `edit_image` | Edit an existing image with natural language instructions |
@@ -119,26 +124,36 @@ You can ask the Agent to generate diagrams directly in chat, e.g. "Draw a diagra
 - One-click download
 - Click "Edit image" to provide instructions; the Agent calls `edit_image` to revise
 
-### Two-Layer Memory Architecture
+### Three-Layer Memory System (inspired by Claude Code)
 
-- **L1 Working memory**: current conversation context, automatically injected with paper directory and personal glossary each turn
-- **L2 Cold storage**: all historical conversations persisted locally; Agent retrieves via `search_chat_history` on demand. Sessions are fully isolated to prevent stale conclusions from polluting new conversations
+| Layer | Mechanism | Notes |
+| --- | --- | --- |
+| L1 Working memory | Paper directory + glossary + session research notes | Injected into system prompt each turn |
+| L2 Session Memory | Structured 9-section template (Current State / Task / Key Results / Errors …) | Incrementally updated each turn; "Key Results" kept verbatim — solves forgetting earlier context after a few turns |
+| L3 Cross-session memory | 4 types (user / feedback / project / reference) + index + on-demand ≤5 | Remembers user profile, research topics, resource pointers across sessions, with staleness warnings |
 
-### Five-Level Context Compression for Long Research Sessions
+- **Session Memory**: the session continuously maintains a structured research notebook, incrementally updated and injected into the system prompt each turn; key conclusions are kept verbatim so they survive context compression.
+- **Cross-session persistent memory**: a one-line-per-entry index is always injected, and a lightweight call selects up to 5 relevant memories on demand (with staleness warnings); durable user profile / feedback / research topic / resource-pointer memories are extracted automatically at the end of each turn.
+- **Chat history**: retrieved via `search_chat_history` on demand; sessions are fully isolated to prevent stale conclusions from polluting new conversations.
 
-| Level | Trigger | Action | API Cost |
+### Five-Level Context Compression, Token-Triggered
+
+| Level | Trigger (estimated tokens) | Action | API Cost |
 | --- | --- | --- | --- |
-| L1 Snip | >4 turns | Compress old tool results to structural index (keep location, discard body) | None |
-| L2 Micro | >8 turns | Fold old tool call pairs into one-line summaries | None |
-| L3 Fold | >12 turns | Truncate old message content | None |
-| L4 Auto | >16 turns | LLM generates full summary to replace old turns | Yes |
-| L5 Emergency | >80K chars | Force-keep last 3 turns only | None |
+| L1 Snip | >12K | Compress old tool results to structural index (keep location, discard body) | None |
+| L2 Micro | >18K | Fold old tool call pairs into one-line summaries | None |
+| L3 Fold | >24K | Truncate old message content | None |
+| L4 Auto | >30K | Summarize old turns with Session Memory (fallback: LLM summary) | Yes (only without Session Memory) |
+| L5 Emergency | >45K | Force-keep last 3 turns only | None |
 
-Circuit breaker: L4 stops retrying after 3 consecutive failures to avoid wasting API calls.
+Compression is triggered by estimated token count, not turn count — a large section read (thousands of characters) must not count the same as a one-line chat. Circuit breaker: L4 stops retrying after 3 consecutive failures.
 
 ### Additional Details
 
+- **Structured search (grep-style)**: AND semantics for English multi-word queries, phrase-first ranking; count / files_with_matches / content modes; `-C` context, `offset` paging; `[block_idx]` line numbers
 - **Bilingual search**: Chinese queries automatically search both Chinese and English keywords; Chinese names also try pinyin variants to maximize recall
+- **Parallel research subagents**: complex multi-paper comparisons automatically fan out to read-only subagents, with live progress and main-context protection
+- **Output style guidance**: lead with the answer, cite with "paper + block_idx"
 - **Streaming output**: tool call phase uses non-streaming for reliable JSON; final answer streams via SSE with real-time tool call display
 - **Citation tracing**: every answer includes citation cards — clicking one opens the source paper and **auto-scrolls to the exact paragraph** (block-level precision)
 - **Session minimap**: a thumbnail navigation bar on the right side of the chat page tracks your current position in real time
@@ -157,7 +172,7 @@ Circuit breaker: L4 stops retrying after 3 consecutive failures to avoid wasting
 | UI Components | Element Plus | |
 | Formula Rendering | KaTeX | |
 | Translation LLM | DeepSeek Chat | Paragraph translation + Agent conversation |
-| Vision LLM | Qwen3-VL-Flash / Qwen-Image-2.0-Pro / Qwen-Image-2.0 | OCR + image translation + image generation |
+| Vision LLM | Qwen3.8-Flash / Qwen-Image-2.0-Pro / Qwen-Image-2.0 | OCR + image translation + image generation |
 | PDF Parsing | MinerU API | |
 
 ---
@@ -172,9 +187,6 @@ cd z-paper
 
 # Windows
 start.bat
-
-# Linux / macOS
-bash start.sh
 ```
 
 On first launch, you will be redirected to the settings page. Enter three API keys:
@@ -206,6 +218,15 @@ If discovery cannot find the other device, check that the system firewall allows
 ---
 
 ## Changelog
+
+### v3.0.0
+- **Knowledge base chat overhaul (inspired by Claude Code architecture)**: rewritten system prompt — parallel tool calls, "locate → count → read" workflow, TodoWrite task planning, and output style guidance.
+- **Search recall rework**: removed result caps (return every match); English multi-word queries now use AND semantics (previously OR caused false positives); grep-style count / files_with_matches / content modes, `-C` context, `offset` paging; `get_paper_section` prefixes each paragraph with `[block_idx]` (cat -n equivalent).
+- **Session Memory**: a structured 9-section notebook with "Key Results" kept verbatim, incrementally updated and injected into the system prompt each turn — fixes forgetting earlier context after a few turns.
+- **Cross-session persistent memory**: 4 types (user / feedback / project / reference) + index + on-demand selection of up to 5 + staleness warnings + automatic end-of-turn extraction.
+- **Parallel research subagents**: `spawn_research` fans out multiple read-only subagents concurrently with live progress, protecting the main context.
+- **Token-triggered compression**: five levels now trigger by estimated token count instead of turn count, with Session Memory preferred over LLM summarization.
+- **Chat page enhancements**: per-message (Q&A) one-click copy, whole-conversation ZIP export (with images), floating top bar (session rename + export).
 
 ### v2.2.2
 - **Vision model upgrade**: The Qwen vision model is upgraded from the deprecated `qwen3-vl-flash` to the multimodal `qwen3.8-flash`, with thinking mode disabled (`enable_thinking: false`) to reduce latency and token usage.

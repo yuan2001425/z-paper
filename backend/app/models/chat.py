@@ -12,6 +12,7 @@ class ChatSession(Base):
     history_json       = Column(JSON, default=list)   # 工作消息列表（L1 记忆）
     compaction_summary = Column(Text, nullable=True)   # 旧版压缩摘要字段（兼容）
     auto_summary       = Column(Text, nullable=True)   # L2 温数据：本会话话题摘要
+    session_memory     = Column(Text, nullable=True)   # 会话内持续累积的研究笔记（解决遗忘）
     compact_failures   = Column(Integer, default=0)    # 熔断计数器：L4 连续失败次数
     created_at         = Column(DateTime, default=datetime.utcnow)
     updated_at         = Column(DateTime, default=datetime.utcnow)

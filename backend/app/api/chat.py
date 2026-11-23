@@ -8,19 +8,28 @@ chat.py — 知识库对话 API
   DELETE /api/v1/chat/sessions/{session_id}           — 删除会话
 """
 
+import io
 import json
+import logging
+import re
 import uuid
+import zipfile
 from datetime import datetime
+from pathlib import Path
 from typing import Optional
+from urllib.parse import quote
 
 from fastapi import APIRouter, Depends, HTTPException
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
 from sqlalchemy.orm import Session
 
+from app.config import settings
 from app.database import get_db, SessionLocal
 from app.models.chat import ChatSession, ChatMessage
-from app.services.chat_agent import run_chat_turn, run_chat_turn_stream
+from app.services.chat_agent import run_chat_turn, run_chat_turn_stream, update_session_memory, extract_durable_memories
+
+logger = logging.getLogger(__name__)
 
 router = APIRouter()
 
@@ -28,6 +37,10 @@ router = APIRouter()
 class ChatRequest(BaseModel):
     message: str
     session_id: Optional[str] = None
+
+
+class RenameRequest(BaseModel):
+    title: str
 
 
 # ── 发送消息 ──────────────────────────────────────────────────────────────────
@@ -96,6 +109,23 @@ def send_message(req: ChatRequest, db: Session = Depends(get_db)):
 
     db.commit()
 
+    # 增量更新会话研究笔记（事务外，避免长事务阻塞），解决「多问几句就忘」
+    answer_text = result.get("answer", "")
+    if answer_text:
+        try:
+            new_memory = update_session_memory(session.session_memory, req.message, answer_text, result.get("tool_calls"))
+            if new_memory and new_memory != session.session_memory:
+                with SessionLocal() as db2:
+                    s = db2.query(ChatSession).filter(ChatSession.id == session.id).first()
+                    if s:
+                        s.session_memory = new_memory
+                        s.updated_at = datetime.utcnow()
+                        db2.commit()
+            # 轮末提取跨会话持久记忆（事务外，best-effort；若本轮已 save_memory 则跳过）
+            extract_durable_memories(req.message, answer_text, result.get("tool_calls"))
+        except Exception as e:
+            logger.warning(f"更新会话研究笔记失败: {e}")
+
     return {
         "session_id":  session.id,
         "message_id":  assistant_id,
@@ -147,11 +177,12 @@ def send_message_stream(req: ChatRequest):
         history            = list(session.history_json or [])
         compaction_summary = session.compaction_summary
         compact_failures   = session.compact_failures or 0
+        session_memory     = session.session_memory
 
     def sse_gen():
         final: dict = {}
         try:
-            for event in run_chat_turn_stream(req.message, history, compaction_summary, session_id, compact_failures):
+            for event in run_chat_turn_stream(req.message, history, compaction_summary, session_id, compact_failures, session_memory):
                 if event["type"] == "done":
                     final = event
                 else:
@@ -184,6 +215,23 @@ def send_message_stream(req: ChatRequest):
                     db.commit()
         except Exception as e:
             pass  # DB 保存失败不影响客户端已收到的内容
+
+        # 增量更新会话研究笔记（事务外，避免长事务阻塞），解决「多问几句就忘」
+        answer_text = final.get("answer", "")
+        if answer_text:
+            try:
+                new_memory = update_session_memory(session_memory, req.message, answer_text, final.get("tool_calls"))
+                if new_memory and new_memory != session_memory:
+                    with SessionLocal() as db:
+                        s = db.query(ChatSession).filter(ChatSession.id == session_id).first()
+                        if s:
+                            s.session_memory = new_memory
+                            s.updated_at = datetime.utcnow()
+                            db.commit()
+                # 轮末提取跨会话持久记忆（事务外，best-effort；若本轮已 save_memory 则跳过）
+                extract_durable_memories(req.message, answer_text, final.get("tool_calls"))
+            except Exception as e:
+                logger.warning(f"更新会话研究笔记失败: {e}")
 
         done_event = {
             "type":       "done",
@@ -261,3 +309,95 @@ def delete_session(session_id: str, db: Session = Depends(get_db)):
     db.delete(session)
     db.commit()
     return {"ok": True}
+
+
+# ── 导出会话（zip：chat.json + 关联图片）──────────────────────────────────────
+
+_IMG_RE = re.compile(r'!\[([^\]]*)\]\(([^)]+)\)')
+
+
+@router.get("/sessions/{session_id}/export")
+def export_session(session_id: str, db: Session = Depends(get_db)):
+    session = db.query(ChatSession).filter(ChatSession.id == session_id).first()
+    if not session:
+        raise HTTPException(404, "会话不存在")
+
+    msgs = (
+        db.query(ChatMessage)
+        .filter(ChatMessage.session_id == session_id)
+        .order_by(ChatMessage.created_at)
+        .all()
+    )
+
+    uploads_root = Path(settings.LOCAL_UPLOAD_PATH)
+    img_map = {}  # 原始相对路径 -> zip 内 arcname
+
+    def _rewrite(content: str) -> str:
+        def _repl(match):
+            alt = match.group(1)
+            url = match.group(2)
+            if '/uploads/' not in url:
+                return match.group(0)
+            rel = url.split('/uploads/', 1)[1].split('?', 1)[0]
+            if rel not in img_map:
+                ext = Path(rel).suffix or '.jpg'
+                img_map[rel] = f"images/img_{len(img_map) + 1:03d}{ext}"
+            return f"![{alt}]({img_map[rel]})"
+        return _IMG_RE.sub(_repl, content)
+
+    data = {
+        "title": session.title,
+        "exported_at": datetime.utcnow().isoformat() + "Z",
+        "messages": [
+            {
+                "role":       m.role,
+                "content":    _rewrite(m.content or ""),
+                "created_at": m.created_at.isoformat() + "Z" if m.created_at else None,
+            }
+            for m in msgs
+        ],
+    }
+
+    buf = io.BytesIO()
+    with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as zf:
+        zf.writestr("chat.json", json.dumps(data, ensure_ascii=False, indent=2))
+        for rel, arcname in img_map.items():
+            src = uploads_root / rel
+            if src.is_file():
+                zf.write(src, arcname)
+    buf.seek(0)
+
+    safe_title = re.sub(r'[\\/:*?"<>|]', '_', session.title or '新对话')
+    ts = datetime.utcnow().strftime('%Y-%m-%dT%H-%M-%S')
+    filename = f"{ts}_{safe_title}.zip"
+
+    # 中文文件名需用 RFC 5987 的 filename* 编码，否则 latin-1 编码报错
+    ascii_name = f"chat_{session_id[:8]}.zip"
+    utf8_name = quote(filename)
+
+    return StreamingResponse(
+        buf,
+        media_type="application/zip",
+        headers={
+            "Content-Disposition": (
+                f'attachment; filename="{ascii_name}"; '
+                f"filename*=UTF-8''{utf8_name}"
+            )
+        },
+    )
+
+
+# ── 重命名会话 ──────────────────────────────────────────────────────────────────
+
+@router.patch("/sessions/{session_id}")
+def rename_session(session_id: str, payload: RenameRequest, db: Session = Depends(get_db)):
+    session = db.query(ChatSession).filter(ChatSession.id == session_id).first()
+    if not session:
+        raise HTTPException(404, "会话不存在")
+    title = payload.title.strip()
+    if not title:
+        raise HTTPException(400, "标题不能为空")
+    session.title = title
+    session.updated_at = datetime.utcnow()
+    db.commit()
+    return {"ok": True, "title": title}
