@@ -28,6 +28,7 @@ from app.config import settings
 from app.database import get_db, SessionLocal
 from app.models.chat import ChatSession, ChatMessage
 from app.services.chat_agent import run_chat_turn, run_chat_turn_stream, update_session_memory, extract_durable_memories
+from app.services.chat_tools import resolve_scope_paper_ids
 
 logger = logging.getLogger(__name__)
 
@@ -37,6 +38,11 @@ router = APIRouter()
 class ChatRequest(BaseModel):
     message: str
     session_id: Optional[str] = None
+    scope_folder_ids: Optional[list[int]] = None  # 搜索范围：选中的文件夹 id（None=沿用会话已有范围）
+
+
+class ScopeRequest(BaseModel):
+    scope_folder_ids: list[int]  # 空列表=全部论文
 
 
 class RenameRequest(BaseModel):
@@ -67,6 +73,10 @@ def send_message(req: ChatRequest, db: Session = Depends(get_db)):
         db.add(session)
         db.flush()
 
+    # 更新搜索范围（请求里带了才更新；否则沿用会话已有范围）
+    if req.scope_folder_ids is not None:
+        session.scope_folder_ids = req.scope_folder_ids
+
     # 保存用户消息
     db.add(ChatMessage(
         id=str(uuid.uuid4()),
@@ -78,6 +88,9 @@ def send_message(req: ChatRequest, db: Session = Depends(get_db)):
         created_at=datetime.utcnow(),
     ))
 
+    # 解析搜索范围（文件夹 → 论文 ID 集合）
+    scope_paper_ids = resolve_scope_paper_ids(session.scope_folder_ids or [])
+
     # 运行 agent（可能耗时较长）
     result = run_chat_turn(
         user_message=req.message,
@@ -85,6 +98,8 @@ def send_message(req: ChatRequest, db: Session = Depends(get_db)):
         compaction_summary=session.compaction_summary,
         session_id=session.id,
         compact_failures=session.compact_failures or 0,
+        session_memory=session.session_memory,
+        scope_paper_ids=scope_paper_ids,
     )
 
     # 保存 AI 回复
@@ -162,6 +177,10 @@ def send_message_stream(req: ChatRequest):
             db.add(session)
             db.flush()
 
+        # 更新搜索范围（请求里带了才更新；否则沿用会话已有范围）
+        if req.scope_folder_ids is not None:
+            session.scope_folder_ids = req.scope_folder_ids
+
         db.add(ChatMessage(
             id=str(uuid.uuid4()),
             session_id=session.id,
@@ -178,11 +197,12 @@ def send_message_stream(req: ChatRequest):
         compaction_summary = session.compaction_summary
         compact_failures   = session.compact_failures or 0
         session_memory     = session.session_memory
+        scope_paper_ids    = resolve_scope_paper_ids(session.scope_folder_ids or [])
 
     def sse_gen():
         final: dict = {}
         try:
-            for event in run_chat_turn_stream(req.message, history, compaction_summary, session_id, compact_failures, session_memory):
+            for event in run_chat_turn_stream(req.message, history, compaction_summary, session_id, compact_failures, session_memory, scope_paper_ids):
                 if event["type"] == "done":
                     final = event
                 else:
@@ -263,7 +283,7 @@ def list_sessions(db: Session = Depends(get_db)):
         .all()
     )
     return [
-        {"id": s.id, "title": s.title, "updated_at": s.updated_at}
+        {"id": s.id, "title": s.title, "updated_at": s.updated_at, "scope_folder_ids": s.scope_folder_ids or []}
         for s in sessions
     ]
 
@@ -283,7 +303,7 @@ def get_messages(session_id: str, db: Session = Depends(get_db)):
         .all()
     )
     return {
-        "session":  {"id": session.id, "title": session.title},
+        "session":  {"id": session.id, "title": session.title, "scope_folder_ids": session.scope_folder_ids or []},
         "messages": [
             {
                 "id":         m.id,
@@ -401,3 +421,17 @@ def rename_session(session_id: str, payload: RenameRequest, db: Session = Depend
     session.updated_at = datetime.utcnow()
     db.commit()
     return {"ok": True, "title": title}
+
+
+# ── 更新会话搜索范围 ────────────────────────────────────────────────────────────
+
+@router.patch("/sessions/{session_id}/scope")
+def update_scope(session_id: str, payload: ScopeRequest, db: Session = Depends(get_db)):
+    """设置会话的搜索范围（选中的文件夹 id 列表，空列表=全部论文）。"""
+    session = db.query(ChatSession).filter(ChatSession.id == session_id).first()
+    if not session:
+        raise HTTPException(404, "会话不存在")
+    session.scope_folder_ids = payload.scope_folder_ids
+    session.updated_at = datetime.utcnow()
+    db.commit()
+    return {"ok": True, "scope_folder_ids": payload.scope_folder_ids}

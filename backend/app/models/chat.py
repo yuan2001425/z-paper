@@ -14,6 +14,7 @@ class ChatSession(Base):
     auto_summary       = Column(Text, nullable=True)   # L2 温数据：本会话话题摘要
     session_memory     = Column(Text, nullable=True)   # 会话内持续累积的研究笔记（解决遗忘）
     compact_failures   = Column(Integer, default=0)    # 熔断计数器：L4 连续失败次数
+    scope_folder_ids   = Column(JSON, default=list)    # 搜索范围：选中的文件夹 id 列表（空=全部论文）
     created_at         = Column(DateTime, default=datetime.utcnow)
     updated_at         = Column(DateTime, default=datetime.utcnow)
 

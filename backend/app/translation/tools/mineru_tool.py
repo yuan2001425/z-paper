@@ -41,7 +41,7 @@ class MineruParseTool:
         # ── Step 1：请求预签名上传地址 ─────────────────────────────────────
         logger.warning("[MinerU] 请求预签名上传地址，文件：%s (%d bytes)",
                        self.filename, len(self.pdf_bytes))
-        with httpx.Client(timeout=30.0) as client:
+        with httpx.Client(trust_env=False, timeout=30.0) as client:
             resp = client.post(
                 f"{_API_BASE}/file-urls/batch",
                 headers=headers,
@@ -61,7 +61,7 @@ class MineruParseTool:
         logger.warning("[MinerU] batch_id=%s，开始上传文件", batch_id)
 
         # ── Step 2：PUT 文件到预签名地址 ───────────────────────────────────
-        with httpx.Client(timeout=300.0) as client:
+        with httpx.Client(trust_env=False, timeout=300.0) as client:
             resp = client.put(upload_url, content=self.pdf_bytes)
             resp.raise_for_status()
         logger.warning("[MinerU] 文件上传完成，开始轮询结果")
@@ -70,7 +70,7 @@ class MineruParseTool:
         poll_headers = {"Authorization": f"Bearer {settings.MINERU_API_KEY}"}
         for attempt in range(120):  # 最多等 10 分钟
             time.sleep(5)
-            with httpx.Client(timeout=30.0) as client:
+            with httpx.Client(trust_env=False, timeout=30.0) as client:
                 resp = client.get(
                     f"{_API_BASE}/extract-results/batch/{batch_id}",
                     headers=poll_headers,
@@ -100,7 +100,7 @@ class MineruParseTool:
     def _download_and_parse(self, zip_url: str) -> dict:
         """下载 zip，提取 .md 文件与图片，返回 {"markdown": str}"""
         logger.warning("[MinerU] 下载结果 zip：%s", zip_url)
-        with httpx.Client(timeout=120.0, follow_redirects=True) as client:
+        with httpx.Client(trust_env=False, timeout=120.0, follow_redirects=True) as client:
             resp = client.get(zip_url)
             resp.raise_for_status()
 

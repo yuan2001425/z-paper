@@ -41,6 +41,7 @@ with engine.connect() as _conn:
         ("auto_summary",     "TEXT"),
         ("compact_failures", "INTEGER DEFAULT 0"),
         ("session_memory",   "TEXT"),
+        ("scope_folder_ids", "TEXT"),
     ]:
         try:
             _conn.execute(_sql_text(

@@ -73,7 +73,7 @@ def translate_title(
     )
 
     try:
-        with httpx.Client(timeout=20) as client:
+        with httpx.Client(trust_env=False, timeout=20) as client:
             resp = client.post(
                 f"{settings.DEEPSEEK_BASE_URL}/chat/completions",
                 headers={

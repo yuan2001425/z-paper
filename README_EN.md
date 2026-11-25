@@ -219,6 +219,12 @@ If discovery cannot find the other device, check that the system firewall allows
 
 ## Changelog
 
+### v3.1.0
+- **Chat search scope**: choose which folders (including subfolders) the chat can search — only papers in scope are searched/read; scope persists per session and is inherited by subagents.
+- **Tool flow visualization**: tool calls are now horizontal chips instead of a vertical list, with arrows for serial steps and a dashed group for parallel batches.
+- **Fix tool-call garbling**: DeepSeek's stream-phase tool-call markup (`<tool_call>` JSON / DSML) was previously unparsed and leaked as garbage; now parsed and stripped with a fallback.
+- **Fix network connections**: all external API calls now connect directly (bypassing the system proxy), fixing SSL connection resets after the proxy is turned off.
+
 ### v3.0.1
 - **Clickable inline citations**: paragraph references now use the standard `[block N](paper_id)` markdown link, rendered as a `¶N` badge; clicking opens the paper in a new tab and scrolls to the exact paragraph.
 - **Complete citation cards**: citations are now extracted from the answer text precisely (previously each tool only collected the top 3 and section-read produced none, showing only ~6 papers).

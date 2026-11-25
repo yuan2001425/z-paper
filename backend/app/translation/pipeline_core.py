@@ -118,7 +118,7 @@ def _call_llm(
             log_tag, prompt_text,
         )
 
-    with httpx.Client(timeout=120) as client:
+    with httpx.Client(trust_env=False, timeout=120) as client:
         resp = client.post(
             f"{settings.DEEPSEEK_BASE_URL}/chat/completions",
             headers={

@@ -32,7 +32,7 @@ from app.models.job import JobStatus, TranslationJob
 
 router = APIRouter()
 
-SYNC_APP_VERSION = "3.0.1"
+SYNC_APP_VERSION = "3.1.0"
 SYNC_TTL_MINUTES = 15
 DISCOVERY_PORT = 37621
 _pending_requests: dict[str, dict] = {}
@@ -781,7 +781,7 @@ def _replace_current_data(extract_dir: Path) -> dict:
 
 async def _fetch_manifest(source_base_url: str, request_id: str, token: str) -> dict:
     url = f"{source_base_url}/api/v1/sync/manifest/{quote(request_id)}"
-    async with httpx.AsyncClient(timeout=30.0) as client:
+    async with httpx.AsyncClient(trust_env=False, timeout=30.0) as client:
         response = await client.get(url, params={"token": token})
         if response.status_code != 200:
             raise HTTPException(status_code=response.status_code, detail=response.text or "拉取来源清单失败")
@@ -798,7 +798,7 @@ async def _download_bundle(
 ) -> None:
     url = f"{source_base_url}/api/v1/sync/export/{quote(request_id)}"
     timeout = httpx.Timeout(30.0, read=None, write=30.0, pool=30.0)
-    async with httpx.AsyncClient(timeout=timeout) as client:
+    async with httpx.AsyncClient(trust_env=False, timeout=timeout) as client:
         async with client.stream("POST", url, params={"token": token}, json=selection.model_dump()) as response:
             if response.status_code != 200:
                 detail = await response.aread()
@@ -899,7 +899,7 @@ async def send_sync_request(payload: OutboundSyncRequest):
         "expires_at": expires_at.isoformat() + "Z",
     }
     try:
-        async with httpx.AsyncClient(timeout=10.0) as client:
+        async with httpx.AsyncClient(trust_env=False, timeout=10.0) as client:
             response = await client.post(f"{target_base_url}/api/v1/sync/requests", json=request_payload)
             response.raise_for_status()
     except Exception as exc:

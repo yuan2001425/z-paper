@@ -62,6 +62,7 @@ def run_subagent(
     execute_tool_fn,
     tool_specs: list[dict],
     max_iters: int = _MAX_ITERS,
+    scope_paper_ids=None,
 ) -> str:
     """跑一个只读研究子代理，返回其总结文本。"""
     tools = _read_only_specs(tool_specs)
@@ -84,7 +85,7 @@ def run_subagent(
             except Exception:
                 args = {}
             try:
-                result_str = execute_tool_fn(func["name"], args)
+                result_str = execute_tool_fn(func["name"], args, scope_paper_ids=scope_paper_ids)
             except Exception as e:
                 result_str = json.dumps({"error": str(e)}, ensure_ascii=False)
             messages.append({
@@ -108,6 +109,7 @@ def spawn_research(
     execute_tool_fn,
     tool_specs: list[dict],
     on_event=None,
+    scope_paper_ids=None,
 ) -> str:
     """并行跑多个研究子任务。tasks = [{task_id?, prompt}]。返回 JSON 结果列表（保持顺序）。
 
@@ -141,7 +143,7 @@ def spawn_research(
     # 并发：每个子代理一个线程；子代理内部串行多轮工具调用，不同子代理之间并行
     with ThreadPoolExecutor(max_workers=len(normalized)) as pool:
         futures = {
-            pool.submit(run_subagent, t["prompt"], call_deepseek, execute_tool_fn, tool_specs): t
+            pool.submit(run_subagent, t["prompt"], call_deepseek, execute_tool_fn, tool_specs, _MAX_ITERS, scope_paper_ids): t
             for t in normalized
         }
         for fut in as_completed(futures):

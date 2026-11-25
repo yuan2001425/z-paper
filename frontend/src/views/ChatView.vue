@@ -79,11 +79,17 @@
                   </span>
                 </div>
                 <div v-if="expandedSteps[msg.id]" class="tool-steps-body">
-                  <div v-for="(tc, i) in msg.tool_calls" :key="i" class="tool-step-item">
-                    <el-icon v-if="tc.running" class="tool-running-icon"><Loading /></el-icon>
-                    <span v-else class="tool-done-dot">✓</span>
-                    <span class="tool-name">{{ toolLabel(tc.name) }}</span>
-                    <span class="tool-args">{{ formatArgs(tc.args) }}</span>
+                  <div class="tool-flow">
+                    <template v-for="(group, gi) in groupedTools(msg.tool_calls)" :key="gi">
+                      <span v-if="gi > 0" class="tool-flow-arrow">→</span>
+                      <span class="tool-flow-group" :class="{ 'is-parallel': group.length > 1 }">
+                        <span v-for="(tc, i) in group" :key="i" class="tool-chip" :title="formatArgs(tc.args)">
+                          <el-icon v-if="tc.running" class="tool-running-icon"><Loading /></el-icon>
+                          <span v-else class="tool-done-dot">✓</span>
+                          <span class="tool-name">{{ toolLabel(tc.name) }}</span>
+                        </span>
+                      </span>
+                    </template>
                   </div>
                 </div>
               </div>
@@ -157,6 +163,24 @@
             />
             <el-button type="primary" size="small" @click="sendEditImage">发送编辑</el-button>
           </div>
+        </div>
+
+        <!-- 搜索范围选择 -->
+        <div class="scope-bar">
+          <span class="scope-label">📂 搜索范围</span>
+          <el-select
+            v-model="scopeFolderIds"
+            multiple
+            collapse-tags
+            collapse-tags-tooltip
+            clearable
+            placeholder="全部论文"
+            size="small"
+            class="scope-select"
+            :disabled="streaming"
+          >
+            <el-option v-for="f in folders" :key="f.id" :label="f.name" :value="f.id" />
+          </el-select>
         </div>
 
         <!-- 输入区 -->
@@ -257,6 +281,8 @@ const sessions         = ref([])
 const currentSessionId = ref(null)
 const messages         = ref([])
 const inputText        = ref('')
+const folders          = ref([])
+const scopeFolderIds   = ref([])  // 搜索范围：选中的文件夹 id（空=全部论文）
 const streaming        = ref(false)   // true while SSE stream is open
 const messagesEl       = ref(null)
 const paperTitles      = reactive({}) // paper_id → title cache
@@ -337,11 +363,17 @@ async function loadSessions() {
   sessions.value = res.data
 }
 
+async function loadFolders() {
+  const res = await api.get('/folders')
+  folders.value = res.data.folders || []
+}
+
 async function switchSession(id) {
   if (streaming.value) return
   currentSessionId.value = id
   const res = await api.get(`/chat/sessions/${id}/messages`)
   messages.value = res.data.messages
+  scopeFolderIds.value = res.data.session?.scope_folder_ids || []
   await nextTick()
   scrollToBottom()
 }
@@ -350,6 +382,7 @@ function newSession() {
   if (streaming.value) return
   currentSessionId.value = null
   messages.value = []
+  scopeFolderIds.value = []
 }
 
 async function deleteSession(id) {
@@ -391,6 +424,7 @@ async function sendMessage() {
       body:    JSON.stringify({
         message:    text,
         session_id: currentSessionId.value || undefined,
+        scope_folder_ids: scopeFolderIds.value,
       }),
     })
 
@@ -437,7 +471,7 @@ async function sendMessage() {
 function handleStreamEvent(event, aiMsg) {
   switch (event.type) {
     case 'tool_start':
-      aiMsg.tool_calls.push({ name: event.name, args: event.args, running: true })
+      aiMsg.tool_calls.push({ name: event.name, args: event.args, running: true, batch: event.batch ?? null })
       // 自动展开工具步骤面板
       expandedSteps[aiMsg.id] = true
       nextTick(scrollToBottom)
@@ -449,13 +483,16 @@ function handleStreamEvent(event, aiMsg) {
       break
     }
 
-    case 'subagent_start':
+    case 'subagent_start': {
+      // 子任务归到 spawn_research 所在的同一批（并行）
+      const lastBatch = [...aiMsg.tool_calls].reverse().find(t => !t.subagent)?.batch
       for (const tid of (event.tasks || [])) {
-        aiMsg.tool_calls.push({ name: 'subagent', args: { task: tid }, running: true, subagent: true, task_id: tid })
+        aiMsg.tool_calls.push({ name: 'subagent', args: { task: tid }, running: true, subagent: true, task_id: tid, batch: lastBatch })
       }
       expandedSteps[aiMsg.id] = true
       nextTick(scrollToBottom)
       break
+    }
 
     case 'subagent_done': {
       const last = [...aiMsg.tool_calls].reverse().find(t => t.subagent && t.running && t.task_id === event.task_id)
@@ -607,6 +644,21 @@ function formatArgs(args) {
   return parts.join(' · ')
 }
 
+// 把工具调用按 batch 分组：同一批（batch 相同且连续）视为并行，不同批为串行
+function groupedTools(toolCalls) {
+  const groups = []
+  let cur = null
+  for (const tc of toolCalls) {
+    if (cur && tc.batch != null && tc.batch === cur[0]?.batch) {
+      cur.push(tc)
+    } else {
+      cur = [tc]
+      groups.push(cur)
+    }
+  }
+  return groups
+}
+
 function renderAnswer(text) {
   if (!text) return ''
   // 把 [block N](paper_id) 引用转成可点击跳转的徽章链接（¶ 表示段落，与底部引用卡片一致）
@@ -720,6 +772,7 @@ function groupCitations(citations) {
 
 onMounted(() => {
   loadSessions()
+  loadFolders()
   nextTick(() => {
     messagesEl.value?.addEventListener('scroll', onMessagesScroll, { passive: true })
   })
@@ -939,12 +992,16 @@ onUnmounted(() => {
 .steps-arrow { font-size: 12px; transition: transform 0.2s; flex-shrink: 0; }
 .tool-steps.expanded .steps-arrow { transform: rotate(90deg); }
 .tool-steps-body { padding: 4px 10px 8px; border-top: 1px solid #e4e7ed; }
-.tool-step-item { display: flex; gap: 8px; padding: 2px 0; }
+.tool-flow { display: flex; flex-wrap: wrap; align-items: center; gap: 2px; }
+.tool-flow-arrow { color: #c0c4cc; margin: 0 3px; font-size: 0.8rem; user-select: none; }
+.tool-flow-group { display: inline-flex; align-items: center; gap: 3px; padding: 2px 3px; border-radius: 4px; }
+.tool-flow-group.is-parallel { background: #ecf5ff; border: 1px dashed #b3d8ff; }
+.tool-chip { display: inline-flex; align-items: center; gap: 3px; padding: 1px 7px; background: #fff; border: 1px solid #e4e7ed; border-radius: 12px; white-space: nowrap; }
+.tool-chip .tool-name { color: #409eff; font-weight: 500; }
 .tool-name { color: #409eff; font-weight: 500; white-space: nowrap; }
-.tool-args { color: #909399; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .tool-running-badge { color: #e6a23c; font-size: 0.75rem; margin-left: 6px; }
-.tool-running-icon { color: #e6a23c; animation: spin 1s linear infinite; flex-shrink: 0; }
-.tool-done-dot { color: #67c23a; font-size: 0.75rem; flex-shrink: 0; width: 14px; text-align: center; }
+.tool-running-icon { color: #e6a23c; animation: spin 1s linear infinite; flex-shrink: 0; font-size: 12px; }
+.tool-done-dot { color: #67c23a; font-size: 0.75rem; flex-shrink: 0; }
 @keyframes spin { from { transform: rotate(0deg); } to { transform: rotate(360deg); } }
 
 /* 回答正文 Markdown 样式 */
@@ -1183,6 +1240,18 @@ onUnmounted(() => {
   flex-shrink: 0;
 }
 .input-area .el-textarea { flex: 1; }
+
+/* 搜索范围选择 */
+.scope-bar {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 8px 24px 0;
+  background: #fff;
+  flex-shrink: 0;
+}
+.scope-label { font-size: 0.8rem; color: #909399; white-space: nowrap; }
+.scope-select { flex: 1; min-width: 0; }
 
 /* ── 右侧缩略导航 ─────────────────────────────────────────────── */
 .chat-minimap {

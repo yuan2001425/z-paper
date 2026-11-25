@@ -23,7 +23,7 @@ def _http_post_with_retry(url: str, headers: dict, body: dict, timeout: int = 12
     """带指数退避重试的 POST，专门处理 429 限流。"""
     delay = 5
     for attempt in range(max_retries):
-        with httpx.Client(timeout=timeout) as client:
+        with httpx.Client(trust_env=False, timeout=timeout) as client:
             resp = client.post(url, headers=headers, json=body)
         if resp.status_code != 429:
             resp.raise_for_status()
@@ -32,7 +32,7 @@ def _http_post_with_retry(url: str, headers: dict, body: dict, timeout: int = 12
         logger.warning("[ImageTranslation] 429 限流，%d 秒后重试（第 %d/%d 次）", wait, attempt + 1, max_retries)
         time.sleep(wait)
     # 最后一次不捕获，让调用方处理
-    with httpx.Client(timeout=timeout) as client:
+    with httpx.Client(trust_env=False, timeout=timeout) as client:
         resp = client.post(url, headers=headers, json=body)
     resp.raise_for_status()
     return resp
@@ -258,7 +258,7 @@ def _translate_texts(
     )
 
     try:
-        with httpx.Client(timeout=60) as client:
+        with httpx.Client(trust_env=False, timeout=60) as client:
             resp = client.post(
                 f"{settings.DEEPSEEK_BASE_URL}/chat/completions",
                 headers={
@@ -403,7 +403,7 @@ def _edit_image(
             return image_url
 
         # 下载并保存到本地
-        with httpx.Client(timeout=60) as client:
+        with httpx.Client(trust_env=False, timeout=60) as client:
             img_resp = client.get(image_out_url)
             img_resp.raise_for_status()
             edited_bytes = img_resp.content

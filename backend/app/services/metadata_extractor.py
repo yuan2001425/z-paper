@@ -162,7 +162,7 @@ class MetadataExtractor:
 
         t0 = time.time()
         try:
-            with httpx.Client(timeout=90) as client:
+            with httpx.Client(trust_env=False, timeout=90) as client:
                 resp = client.post(
                     f"{settings.QWEN_BASE_URL}/chat/completions",
                     headers={

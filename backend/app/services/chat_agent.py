@@ -229,7 +229,7 @@ def _call_deepseek(messages: list[dict], use_tools: bool = True, tools: list | N
     if response_format:
         payload["response_format"] = response_format
 
-    with httpx.Client(timeout=_TIMEOUT_TOOL) as client:
+    with httpx.Client(trust_env=False, timeout=_TIMEOUT_TOOL) as client:
         resp = client.post(
             f"{settings.DEEPSEEK_BASE_URL}/chat/completions",
             headers={
@@ -291,21 +291,69 @@ def extract_durable_memories(user_message: str, answer: str, tool_calls: Optiona
 
 import re as _re
 
-_DSML_BLOCK_RE  = _re.compile(r'<\uFF5CDSML\uFF5Cfunction_calls>.*?</\uFF5CDSML\uFF5Cfunction_calls>', _re.DOTALL)
-_DSML_INVOKE_RE = _re.compile(r'<\uFF5CDSML\uFF5Cinvoke\s+name="([^"]+)">(.*?)</\uFF5CDSML\uFF5Cinvoke>', _re.DOTALL)
-_DSML_PARAM_RE  = _re.compile(r'<\uFF5CDSML\uFF5Cparameter\s+name="([^"]+)"[^>]*>(.*?)</\uFF5CDSML\uFF5Cparameter>', _re.DOTALL)
-_DSML_ANY_RE    = _re.compile(r'<\uFF5CDSML\uFF5C[^>]*>', _re.DOTALL)
+_BAR = '\uFF5C'  # \uFF5C \u5168\u89D2\u7AD6\u7EBF\uFF08DSML \u5206\u9694\u7B26\uFF09
+
+# DeepSeek \u5728 tool_choice="none" \u65F6\uFF0C\u4F1A\u5728 content \u91CC\u7528\u6587\u672C\u8868\u8FBE\u5DE5\u5177\u8C03\u7528\u3002\u5B9E\u9645\u89C2\u5BDF\u5230\u4E24\u79CD\u683C\u5F0F\uFF1A
+#   1) <tool_call>{"name": "...", "arguments": {...}}</tool_call>   \u2014\u2014 \u5F53\u524D\u683C\u5F0F
+#   2) <\uFF5CDSML\uFF5Cinvoke name="...">...</\uFF5CDSML\uFF5Cinvoke>\uFF08\u5355/\u53CC\u7AD6\u7EBF\u90FD\u517C\u5BB9\uFF09  \u2014\u2014 \u65E7 DSML \u683C\u5F0F
+_TOOL_CALL_RE = _re.compile(r'<tool_call>\s*(\{.*?\})\s*</tool_call>', _re.DOTALL)
+_DSML_INVOKE_RE = _re.compile(
+    r'<' + _BAR + r'+DSML' + _BAR + r'+\s*invoke\b[^>]*name="([^"]+)"[^>]*>(.*?)'
+    r'</' + _BAR + r'+DSML' + _BAR + r'+\s*invoke\s*>', _re.DOTALL)
+_DSML_PARAM_RE = _re.compile(
+    r'(<' + _BAR + r'+DSML' + _BAR + r'+\s*parameter\b[^>]*>)'
+    r'(.*?)'
+    r'(</' + _BAR + r'+DSML' + _BAR + r'+\s*parameter\s*>)', _re.DOTALL)
+# \u515C\u5E95\uFF1A\u6E05\u9664\u4EFB\u4F55\u5DE5\u5177\u8C03\u7528\u6807\u8BB0\uFF08<tool_call> \u6216 DSML\uFF09\uFF0C\u9632\u6B62\u6CC4\u6F0F\u5230\u56DE\u7B54
+_TOOL_MARK_STRIP_RE = _re.compile(
+    r'<tool_call>.*?</tool_call>'
+    r'|</?' + _BAR + r'+DSML' + _BAR + r'+\s*[a-zA-Z_]*\s*[^>]*>', _re.DOTALL)
 
 
-def _extract_dsml_tool_calls(content: str) -> list[dict]:
-    calls = []
-    for invoke in _DSML_INVOKE_RE.finditer(content):
+def _coerce_scalar(v: str):
+    """DSML \u53C2\u6570\u503C\u7C7B\u578B\u8F6C\u6362\uFF08string="false" \u65F6\u503C\u4E3A\u6570\u5B57/\u5E03\u5C14\uFF09\u3002"""
+    if v in ("true", "false"):
+        return v == "true"
+    try:
+        return int(v)
+    except (ValueError, TypeError):
+        pass
+    try:
+        return float(v)
+    except (ValueError, TypeError):
+        pass
+    return v
+
+
+def _extract_tool_calls_from_text(content: str) -> list[dict]:
+    """\u4ECE\u6A21\u578B\u6587\u672C\u91CC\u63D0\u53D6\u5DE5\u5177\u8C03\u7528\uFF0C\u652F\u6301 <tool_call> JSON \u548C DSML invoke \u4E24\u79CD\u683C\u5F0F\u3002"""
+    calls: list[dict] = []
+    # \u683C\u5F0F 1\uFF1A<tool_call> JSON
+    for m in _TOOL_CALL_RE.finditer(content or ""):
+        try:
+            obj = json.loads(m.group(1))
+            name = obj.get("name")
+            if name:
+                calls.append({"name": name, "args": obj.get("arguments") or {}})
+        except Exception:
+            pass
+    # \u683C\u5F0F 2\uFF1ADSML invoke\uFF08\u53C2\u6570\u6309 string="true|false" \u8F6C\u7C7B\u578B\uFF09
+    for invoke in _DSML_INVOKE_RE.finditer(content or ""):
         name = invoke.group(1)
         body = invoke.group(2)
         args: dict = {}
         for param in _DSML_PARAM_RE.finditer(body):
-            args[param.group(1)] = param.group(2).strip()
-        calls.append({"name": name, "args": args})
+            open_tag = param.group(1)
+            val = param.group(2).strip()
+            mname = _re.search(r'name="([^"]+)"', open_tag)
+            if not mname:
+                continue
+            pname = mname.group(1)
+            if 'string="true"' not in open_tag:
+                val = _coerce_scalar(val)
+            args[pname] = val
+        if name:
+            calls.append({"name": name, "args": args})
     return calls
 
 
@@ -323,7 +371,7 @@ def _iter_raw_chunks(messages: list[dict], state: dict | None = None) -> Generat
         "Authorization": f"Bearer {settings.DEEPSEEK_API_KEY}",
         "Content-Type":  "application/json",
     }
-    with httpx.Client(timeout=_TIMEOUT_STREAM) as client:
+    with httpx.Client(trust_env=False, timeout=_TIMEOUT_STREAM) as client:
         with client.stream(
             "POST",
             f"{settings.DEEPSEEK_BASE_URL}/chat/completions",
@@ -353,43 +401,48 @@ def _iter_raw_chunks(messages: list[dict], state: dict | None = None) -> Generat
                     pass
 
 
-_DSML_START    = "<\uFF5CDSML\uFF5C"
-_DSML_FC_CLOSE = "</\uFF5CDSML\uFF5Cfunction_calls>"
+_TOOL_MARK_START_RE = _re.compile(r'<tool_call>|<' + _BAR + r'+DSML' + _BAR + r'+')
+_TOOL_MARK_END_RE   = _re.compile(r'</tool_call>|</' + _BAR + r'+DSML' + _BAR + r'+\s*[a-zA-Z_]*\s*>')
 
 
 def _stream_guarded(messages: list[dict], state: dict | None = None) -> Generator:
-    buf     = ""
-    dsml    = ""
-    in_dsml = False
-    keep    = len(_DSML_START) - 1
+    """\u6D41\u5F0F\u8BFB\u53D6\uFF0C\u628A\u300C\u6B63\u6587\u300D\u4E0E\u300C\u5DE5\u5177\u8C03\u7528\u6807\u8BB0\u300D\u5206\u5F00\uFF1A\u6B63\u6587\u5B9E\u65F6 yield\uFF0C\u6807\u8BB0\u7D2F\u79EF\u5230\u6D41\u7ED3\u675F\u540E\u7EDF\u4E00\u89E3\u6790\u3002
+
+    \u517C\u5BB9 <tool_call> JSON \u4E0E\u65E7 DSML \u4E24\u79CD\u683C\u5F0F\uFF1B\u89E3\u6790\u4E0D\u51FA\u5DE5\u5177\u8C03\u7528\u65F6\u515C\u5E95\u5265\u6389\u6807\u8BB0\uFF0C\u7EDD\u4E0D\u628A\u539F\u59CB\u6807\u8BB0\u6CC4\u6F0F\u6210\u4E71\u7801\u3002
+    """
+    buf       = ""
+    markup    = ""
+    in_markup = False
+    keep      = 24  # \u8DB3\u591F\u5BB9\u7EB3 "<tool_call>" \u6216 "<\uFF5CDSML\uFF5C"
 
     for chunk in _iter_raw_chunks(messages, state):
-        if in_dsml:
-            dsml += chunk
-            if _DSML_FC_CLOSE in dsml:
-                yield _extract_dsml_tool_calls(dsml)
-                return
+        if in_markup:
+            markup += chunk
         else:
             buf += chunk
-            idx = buf.find(_DSML_START)
-            if idx >= 0:
+            m = _TOOL_MARK_START_RE.search(buf)
+            if m:
+                idx = m.start()
                 if idx > 0:
                     yield buf[:idx]
-                dsml    = buf[idx:]
-                buf     = ""
-                in_dsml = True
+                markup    = buf[idx:]
+                buf       = ""
+                in_markup = True
             else:
                 if len(buf) > keep:
                     yield buf[:-keep]
                     buf = buf[-keep:]
 
-    if not in_dsml:
-        if buf:
-            yield buf
-    else:
-        calls = _extract_dsml_tool_calls(dsml)
+    if in_markup:
+        calls = _extract_tool_calls_from_text(markup)
         if calls:
             yield calls
+        else:
+            # \u89E3\u6790\u4E0D\u51FA\u5DE5\u5177\u8C03\u7528\uFF1A\u5265\u6389\u6807\u8BB0\uFF0C\u6B8B\u7559\u6B63\u6587\u5F53\u4F5C\u7B54\u6848\uFF0C\u7EDD\u4E0D\u8BA9\u539F\u59CB\u6807\u8BB0\u6CC4\u6F0F
+            yield _TOOL_MARK_STRIP_RE.sub("", markup)
+    else:
+        if buf:
+            yield buf
 
 
 # ── 五级压缩系统 ──────────────────────────────────────────────────────────────
@@ -670,6 +723,7 @@ def run_chat_turn(
     session_id: Optional[str] = None,
     compact_failures: int = 0,
     session_memory: Optional[str] = None,
+    scope_paper_ids=None,
 ) -> dict:
     """
     执行一轮对话（非流式）。
@@ -712,7 +766,7 @@ def run_chat_turn(
                 args = {}
 
             logger.info(f"[chat_agent] 工具: {name}({list(args.keys())})")
-            result_str = execute_tool(name, args, session_id=session_id, call_deepseek=_call_deepseek)
+            result_str = execute_tool(name, args, session_id=session_id, call_deepseek=_call_deepseek, scope_paper_ids=scope_paper_ids)
 
             # query_database 熔断：连续失败超限后禁用该工具
             if name == "query_database":
@@ -770,6 +824,7 @@ def run_chat_turn_stream(
     session_id: Optional[str] = None,
     compact_failures: int = 0,
     session_memory: Optional[str] = None,
+    scope_paper_ids=None,
 ) -> Generator[dict, None, None]:
     """
     混合模式：非流式工具循环 + 流式最终答案。
@@ -805,7 +860,7 @@ def run_chat_turn_stream(
 
         if not tool_calls:
             raw_content = response_msg.get("content") or ""
-            dsml_calls  = _extract_dsml_tool_calls(raw_content)
+            dsml_calls  = _extract_tool_calls_from_text(raw_content)
             if dsml_calls:
                 logger.info(f"[chat_agent] 检测到 DSML 格式工具调用: {[c['name'] for c in dsml_calls]}")
                 tool_calls = [
@@ -819,8 +874,7 @@ def run_chat_turn_stream(
                     }
                     for i, c in enumerate(dsml_calls)
                 ]
-                clean_content = _DSML_BLOCK_RE.sub("", raw_content)
-                clean_content = _DSML_ANY_RE.sub("", clean_content).strip() or None
+                clean_content = _TOOL_MARK_STRIP_RE.sub("", raw_content).strip() or None
                 response_msg  = {**response_msg, "content": clean_content, "tool_calls": tool_calls}
 
         if not tool_calls:
@@ -837,7 +891,8 @@ def run_chat_turn_stream(
                 args = {}
 
             logger.info(f"[chat_agent] 工具: {name}({list(args.keys())})")
-            yield {"type": "tool_start", "name": name, "args": args}
+            yield {"type": "tool_start", "name": name, "args": args,
+                   "batch": _iter, "parallel": len(tool_calls) > 1}
 
             # spawn_research 会阻塞较久（并行子代理），用后台线程 + 队列把子任务进度实时流给前端，
             # 避免用户长时间静默（对标 Claude Code 的子代理进度通知，但结果仍同步回到本轮）
@@ -849,7 +904,7 @@ def run_chat_turn_stream(
                 def _run_spawn():
                     try:
                         _r = execute_tool(name, args, session_id=session_id, call_deepseek=_call_deepseek,
-                                          on_event=lambda e: _q.put(e))
+                                          on_event=lambda e: _q.put(e), scope_paper_ids=scope_paper_ids)
                         _q.put(("__result__", _r))
                     except Exception as _e:
                         _q.put(("__result__", json.dumps({"error": str(_e)}, ensure_ascii=False)))
@@ -864,7 +919,7 @@ def run_chat_turn_stream(
                     yield _item  # subagent_start / subagent_done 事件
                 _t.join()
             else:
-                result_str = execute_tool(name, args, session_id=session_id, call_deepseek=_call_deepseek)
+                result_str = execute_tool(name, args, session_id=session_id, call_deepseek=_call_deepseek, scope_paper_ids=scope_paper_ids)
 
             # query_database 熔断
             if name == "query_database":
@@ -955,8 +1010,9 @@ def run_chat_turn_stream(
                 name = c["name"]
                 args = c["args"]
                 logger.info(f"[chat_agent] 流式 DSML 工具: {name}({list(args.keys())})")
-                yield {"type": "tool_start", "name": name, "args": args}
-                result_str = execute_tool(name, args, session_id=session_id, call_deepseek=_call_deepseek)
+                yield {"type": "tool_start", "name": name, "args": args,
+                       "batch": 1000 + dsml_rounds, "parallel": len(dsml_calls) > 1}
+                result_str = execute_tool(name, args, session_id=session_id, call_deepseek=_call_deepseek, scope_paper_ids=scope_paper_ids)
                 tool_call_log.append({"name": name, "args": args, "result_snippet": result_str[:300]})
                 _collect_citations(name, args, result_str, citations)
                 yield {"type": "tool_done", "name": name, "snippet": result_str[:300]}
@@ -985,6 +1041,8 @@ def run_chat_turn_stream(
         break
 
     answer = "".join(answer_parts)
+    # 兜底：剥掉任何残留的工具调用标记（<tool_call>/DSML），绝不让其泄漏到最终回答
+    answer = _TOOL_MARK_STRIP_RE.sub("", answer).strip()
 
     new_history = [m for m in api_messages if m.get("role") != "system"]
     new_history, new_compaction, compact_failures = _compress(new_history, compact_failures, session_memory)

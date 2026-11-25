@@ -78,7 +78,7 @@ class BaseLLMCaller(ABC):
                 {"role": "user", "content": user_message},
             ],
         }
-        with httpx.Client(timeout=120.0) as client:
+        with httpx.Client(trust_env=False, timeout=120.0) as client:
             resp = client.post(
                 f"{self.api_base_url}/chat/completions",
                 headers=headers,

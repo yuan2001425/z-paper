@@ -181,15 +181,55 @@ def _snippet(text: str, keywords: list[str], max_len: int = 150) -> str:
     return ("…" if start > 0 else "") + t[start:end] + ("…" if end < len(t) else "")
 
 
+# ── 搜索范围（文件夹 → 论文 ID 集合） ─────────────────────────────────────────
+
+def resolve_scope_paper_ids(folder_ids: list) -> Optional[set]:
+    """把选中的文件夹（含其所有子文件夹）解析成论文 ID 集合。空列表返回 None（不限范围）。"""
+    if not folder_ids:
+        return None
+    from app.models.folder import VirtualFolder, PaperFolderMapping
+    with SessionLocal() as db:
+        all_ids: set = set(folder_ids)
+        def _collect(fid: int):
+            for (cid,) in db.query(VirtualFolder.id).filter(VirtualFolder.parent_id == fid).all():
+                if cid not in all_ids:
+                    all_ids.add(cid)
+                    _collect(cid)
+        for fid in list(folder_ids):
+            _collect(fid)
+        paper_ids = {
+            r[0] for r in db.query(PaperFolderMapping.paper_id)
+            .filter(PaperFolderMapping.folder_id.in_(all_ids)).all()
+        }
+    return paper_ids or None
+
+
+def _check_scope(paper_id: str, scope_paper_ids) -> Optional[str]:
+    """若论文不在当前搜索范围内，返回错误 JSON；在范围内返回 None。"""
+    if scope_paper_ids is not None and paper_id not in scope_paper_ids:
+        return json.dumps({"error": "该论文不在当前对话的搜索范围内"}, ensure_ascii=False)
+    return None
+
+
+# 需要注入「搜索范围」的工具（读论文/搜索类）
+_SCOPED_TOOLS = {
+    "search_papers", "get_paper_outline", "search_in_paper", "get_paper_section",
+    "get_references", "get_annotations", "search_annotations", "search_across_papers",
+    "get_paragraph_context", "get_paper_metadata",
+}
+
+
 # ── 工具 1-7（原有） ────────────────────────────────────────────────────────────
 
-def search_papers(query: str, domain: Optional[str] = None) -> str:
+def search_papers(query: str, domain: Optional[str] = None, scope_paper_ids=None) -> str:
     keywords = _split_keywords(query)
     with SessionLocal() as db:
         papers = db.query(Paper).all()
 
     results = []
     for p in papers:
+        if scope_paper_ids is not None and p.id not in scope_paper_ids:
+            continue
         if domain and p.domain and domain.lower() not in p.domain.lower():
             continue
         searchable = " ".join(filter(None, [
@@ -224,7 +264,10 @@ def search_papers(query: str, domain: Optional[str] = None) -> str:
     )
 
 
-def get_paper_outline(paper_id: str) -> str:
+def get_paper_outline(paper_id: str, scope_paper_ids=None) -> str:
+    err = _check_scope(paper_id, scope_paper_ids)
+    if err:
+        return err
     result = _get_result(paper_id)
     if not result:
         return json.dumps({"error": "未找到该论文的处理结果"}, ensure_ascii=False)
@@ -248,7 +291,10 @@ def get_paper_outline(paper_id: str) -> str:
     }, ensure_ascii=False)
 
 
-def search_in_paper(paper_id: str, query: str, section: Optional[str] = None, context: int = 0) -> str:
+def search_in_paper(paper_id: str, query: str, section: Optional[str] = None, context: int = 0, scope_paper_ids=None) -> str:
+    err = _check_scope(paper_id, scope_paper_ids)
+    if err:
+        return err
     result = _get_result(paper_id)
     if not result:
         return json.dumps({"error": "未找到该论文的处理结果"}, ensure_ascii=False)
@@ -318,11 +364,14 @@ def search_in_paper(paper_id: str, query: str, section: Optional[str] = None, co
     return json.dumps(out, ensure_ascii=False)
 
 
-def get_paper_section(paper_id: str, heading: str, offset: int = 0) -> str:
+def get_paper_section(paper_id: str, heading: str, offset: int = 0, scope_paper_ids=None) -> str:
     """获取指定章节的完整文本内容（从该标题到下一同级/高级标题，排除图片块）。
     每段前带 [block_idx]（对标 Read 的 cat -n 行号），读完可直接用 block_idx 引用/精读。
     若章节过长可通过 offset 分页（每页 50 段）。
     """
+    err = _check_scope(paper_id, scope_paper_ids)
+    if err:
+        return err
     result = _get_result(paper_id)
     if not result:
         return json.dumps({"error": "未找到该论文的处理结果"}, ensure_ascii=False)
@@ -389,7 +438,10 @@ def get_paper_section(paper_id: str, heading: str, offset: int = 0) -> str:
     return json.dumps(out, ensure_ascii=False)
 
 
-def get_references(paper_id: str) -> str:
+def get_references(paper_id: str, scope_paper_ids=None) -> str:
+    err = _check_scope(paper_id, scope_paper_ids)
+    if err:
+        return err
     result = _get_result(paper_id)
     if not result:
         return json.dumps({"error": "未找到该论文的处理结果"}, ensure_ascii=False)
@@ -397,7 +449,10 @@ def get_references(paper_id: str) -> str:
     return json.dumps({"paper_id": paper_id, "references": refs}, ensure_ascii=False)
 
 
-def get_annotations(paper_id: str) -> str:
+def get_annotations(paper_id: str, scope_paper_ids=None) -> str:
+    err = _check_scope(paper_id, scope_paper_ids)
+    if err:
+        return err
     result = _get_result(paper_id)
     if not result:
         return json.dumps({"error": "未找到该论文的处理结果"}, ensure_ascii=False)
@@ -426,7 +481,7 @@ def _annotation_tokens(query: str) -> list[str]:
     return [t for t in tokens if len(t) >= 2]
 
 
-def search_annotations(query: str) -> str:
+def search_annotations(query: str, scope_paper_ids=None) -> str:
     tokens = _annotation_tokens(query)
     if not tokens:
         tokens = [query.lower().strip()]
@@ -439,6 +494,8 @@ def search_annotations(query: str) -> str:
                 tr = db.query(TranslationResult).filter(
                     TranslationResult.id == ann.result_id
                 ).first()
+                if scope_paper_ids is not None and (not tr or tr.paper_id not in scope_paper_ids):
+                    continue
                 paper = db.query(Paper).filter(Paper.id == tr.paper_id).first() if tr else None
                 results.append({
                     "paper_id": tr.paper_id if tr else "",
@@ -453,7 +510,7 @@ def search_annotations(query: str) -> str:
 
 # ── 工具 8-11（新增） ──────────────────────────────────────────────────────────
 
-def search_across_papers(keyword: str, offset: int = 0) -> str:
+def search_across_papers(keyword: str, offset: int = 0, scope_paper_ids=None) -> str:
     """在全库所有论文全文中搜索关键词，返回全部匹配段落（不设数量上限，可 offset 翻页）。"""
     keywords = _split_keywords(keyword)
     all_matches = []
@@ -463,6 +520,8 @@ def search_across_papers(keyword: str, offset: int = 0) -> str:
         paper_map = {p.id: p for p in db.query(Paper).all()}
 
     for tr in results:
+        if scope_paper_ids is not None and tr.paper_id not in scope_paper_ids:
+            continue
         paper = paper_map.get(tr.paper_id)
         if not paper:
             continue
@@ -520,8 +579,11 @@ def search_across_papers(keyword: str, offset: int = 0) -> str:
     return json.dumps(out, ensure_ascii=False)
 
 
-def get_paragraph_context(paper_id: str, block_idx: int, window: int = 2) -> str:
+def get_paragraph_context(paper_id: str, block_idx: int, window: int = 2, scope_paper_ids=None) -> str:
     """以指定段落为中心，获取前后 window 个段落的完整内容（排除图片块）。"""
+    err = _check_scope(paper_id, scope_paper_ids)
+    if err:
+        return err
     result = _get_result(paper_id)
     if not result:
         return json.dumps({"error": "未找到该论文的处理结果"}, ensure_ascii=False)
@@ -553,8 +615,11 @@ def get_paragraph_context(paper_id: str, block_idx: int, window: int = 2) -> str
     }, ensure_ascii=False)
 
 
-def get_paper_metadata(paper_id: str) -> str:
+def get_paper_metadata(paper_id: str, scope_paper_ids=None) -> str:
     """快速获取论文元数据（标题、摘要、作者、年份、期刊、关键词）。"""
+    err = _check_scope(paper_id, scope_paper_ids)
+    if err:
+        return err
     with SessionLocal() as db:
         paper = db.query(Paper).filter(Paper.id == paper_id).first()
 
@@ -660,7 +725,7 @@ def _save_remote_image(remote_url: str, filename: str) -> str:
     """下载远程图片，保存到 chat_generated/，返回本地 /uploads/... URL。"""
     import httpx
     from app.storage.local_storage import local_storage
-    with httpx.Client(timeout=60) as client:
+    with httpx.Client(trust_env=False, timeout=60) as client:
         r = client.get(remote_url)
         r.raise_for_status()
     key = f"chat_generated/{filename}"
@@ -1071,7 +1136,7 @@ RULES:
 ]
 
 
-def execute_tool(name: str, args: dict, session_id: Optional[str] = None, call_deepseek=None, on_event=None) -> str:
+def execute_tool(name: str, args: dict, session_id: Optional[str] = None, call_deepseek=None, on_event=None, scope_paper_ids=None) -> str:
     # todo_write 需要会话上下文来存储任务清单，特殊处理
     if name == "todo_write":
         return todo_write(session_id, (args or {}).get("todos", []))
@@ -1081,12 +1146,15 @@ def execute_tool(name: str, args: dict, session_id: Optional[str] = None, call_d
         if call_deepseek is None:
             return json.dumps({"error": "spawn_research 需要 call_deepseek"}, ensure_ascii=False)
         from app.services import subagent
-        return subagent.spawn_research((args or {}).get("tasks", []), call_deepseek, execute_tool, TOOL_SPECS, on_event=on_event)
+        return subagent.spawn_research((args or {}).get("tasks", []), call_deepseek, execute_tool, TOOL_SPECS, on_event=on_event, scope_paper_ids=scope_paper_ids)
 
     func = TOOL_REGISTRY.get(name)
     if not func:
         return json.dumps({"error": f"未知工具: {name}"}, ensure_ascii=False)
     try:
+        # 需要搜索范围注入的工具
+        if name in _SCOPED_TOOLS:
+            return func(scope_paper_ids=scope_paper_ids, **args)
         return func(**args)
     except Exception as e:
         logger.error(f"[chat_tools] 工具 {name} 失败: {e}", exc_info=True)
